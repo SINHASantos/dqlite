@@ -38,13 +38,19 @@ struct worker {
 static void *client_read(void *data)
 {
 	const char *sql =
-	    "SELECT MAX(n)         "
-	    "FROM (                "
-	    "    SELECT n          "
-	    "    FROM test         "
-	    "    ORDER BY random() "
-	    "    LIMIT 100         "
-	    ")                     ";
+		"WITH RECURSIVE seq(n, id) AS ("
+		"    SELECT 1, random()        "
+		"    UNION ALL                 "
+		"    SELECT n+1, random()      "
+		"    FROM seq                  "
+		"    WHERE n < 100             "
+		")                             "
+		"SELECT MAX(test.n)            "
+		"FROM test JOIN seq            "
+		"    ON test.rowid = seq.id % ("
+		"        SELECT MAX(rowid)     "
+		"        FROM test             "
+		"    )                         ";
 
 	struct worker *self = data;
 	struct client_proto client;
@@ -60,7 +66,7 @@ static void *client_read(void *data)
 		QUERY_DONE_C(&client, stmt_id, &rows, {});
 	}
 
-	test_server_client_close(&self->f->server, &client);
+	clientClose(&client);
 	return NULL;
 }
 
@@ -96,7 +102,7 @@ static void *client_write(void *data)
 		}
 	}
 
-	test_server_client_close(&self->f->server, &client);
+	clientClose(&client);
 	return NULL;
 }
 

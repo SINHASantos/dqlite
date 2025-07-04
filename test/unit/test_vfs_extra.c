@@ -193,88 +193,54 @@ static void vfsFillDbPath(struct fixture *f,
 		}                                                             \
 	} while (0)
 
-/* Hold WAL replication information about a single transaction. */
-struct tx
-{
-	unsigned n;
-	unsigned long *page_numbers;
-	void *frames;
-};
-
 /* Poll the given VFS object and serialize the transaction data into the given
  * tx object. */
-#define POLL(VFS, TX)                                                      \
-	do {                                                               \
-		sqlite3_vfs *vfs = sqlite3_vfs_find(VFS);                  \
-		dqlite_vfs_frame *_frames;                                 \
-		unsigned _i;                                               \
-		int _rv;                                                   \
-		memset(&TX, 0, sizeof TX);                                 \
-		char path[VFS_PATH_SZ];                                    \
-		struct fixture *f = data;                                  \
-		vfsFillDbPath(f, VFS, "test.db", path);                    \
-		_rv = VfsPoll(vfs, path, &_frames, &TX.n); \
-		munit_assert_int(_rv, ==, 0);                              \
-		if (_frames != NULL) {                                     \
-			TX.page_numbers =                                  \
-			    munit_malloc(sizeof *TX.page_numbers * TX.n);  \
-			TX.frames = munit_malloc(DB_PAGE_SIZE * TX.n);     \
-			for (_i = 0; _i < TX.n; _i++) {                    \
-				dqlite_vfs_frame *_frame = &_frames[_i];   \
-				TX.page_numbers[_i] = _frame->page_number; \
-				memcpy(TX.frames + _i * DB_PAGE_SIZE,      \
-				       _frame->data, DB_PAGE_SIZE);        \
-				sqlite3_free(_frame->data);                \
-			}                                                  \
-			sqlite3_free(_frames);                             \
-		}                                                          \
+#define POLL(DB, TX)                          \
+	do {                                  \
+		int _rv;                      \
+		_rv = VfsPoll(DB, &(TX));     \
+		munit_assert_int(_rv, ==, 0); \
 	} while (0)
 
 /* Apply WAL frames to the given VFS. */
-#define APPLY(VFS, TX)                                                   \
-	do {                                                             \
-		sqlite3_vfs *vfs = sqlite3_vfs_find(VFS);                \
-		int _rv;                                                 \
-		char path[VFS_PATH_SZ];                                  \
-		struct fixture *f = data;                                \
-		vfsFillDbPath(f, VFS, "test.db", path);                  \
-		_rv = VfsApply(vfs, path, TX.n, TX.page_numbers, TX.frames); \
-		munit_assert_int(_rv, ==, 0);                            \
+#define APPLY(DB, TX)                                                 \
+	do {                                                          \
+		int _rv;                                              \
+		_rv = VfsApply(DB, &(TX)); \
+		munit_assert_int(_rv, ==, 0);                         \
 	} while (0)
 
 /* Abort a transaction on the given VFS. */
-#define ABORT(VFS)                                        \
-	do {                                              \
-		sqlite3_vfs *vfs = sqlite3_vfs_find(VFS); \
-		int _rv;                                  \
-		char path[VFS_PATH_SZ];                   \
-		struct fixture *f = data;                 \
-		vfsFillDbPath(f, VFS, "test.db", path);   \
-		_rv = VfsAbort(vfs, path); \
-		munit_assert_int(_rv, ==, 0);             \
+#define ABORT(DB)                             \
+	do {                                  \
+		int _rv = VfsAbort(DB);       \
+		munit_assert_int(_rv, ==, 0); \
 	} while (0)
 
-/* Release all memory used by a struct tx object. */
-#define DONE(TX)                       \
-	do {                           \
-		free(TX.frames);       \
-		free(TX.page_numbers); \
+/* Release all memory used by a vfsTransaction object. */
+#define DONE(TX)                                                 \
+	do {                                                     \
+		for (unsigned _i = 0; _i < (TX).n_pages; _i++) { \
+			sqlite3_free((TX).pages[_i]);            \
+		}                                                \
+		sqlite3_free((TX).pages);                        \
+		sqlite3_free((TX).page_numbers);                 \
 	} while (0)
 
 /* Peform a full checkpoint on the given database. */
-#define CHECKPOINT(DB)                                                       \
-	do {                                                                 \
-		int _size;                                                   \
-		int _ckpt;                                                   \
-		int _rv;                                                     \
-		_rv = sqlite3_wal_checkpoint_v2(                             \
-		    DB, "main", SQLITE_CHECKPOINT_TRUNCATE, &_size, &_ckpt); \
-		if (_rv != SQLITE_OK) {                                      \
-			munit_errorf("checkpoint: %s (%d)",                  \
-				     sqlite3_errmsg(DB), _rv);               \
-		}                                                            \
-		munit_assert_int(_size, ==, 0);                              \
-		munit_assert_int(_ckpt, ==, 0);                              \
+#define CHECKPOINT(DB)                                                     \
+	do {                                                               \
+		int _size;                                                 \
+		int _ckpt;                                                 \
+		int _rv;                                                   \
+		_rv = sqlite3_wal_checkpoint_v2(                           \
+		    DB, NULL, SQLITE_CHECKPOINT_TRUNCATE, &_size, &_ckpt); \
+		if (_rv != SQLITE_OK) {                                    \
+			munit_errorf("checkpoint: %s (%d)",                \
+				     sqlite3_errmsg(DB), _rv);             \
+		}                                                          \
+		munit_assert_int(_size, ==, 0);                            \
+		munit_assert_int(_ckpt, ==, 0);                            \
 	} while (0)
 
 /* Perform a full checkpoint on a fresh connection, mimicking dqlite's
@@ -288,14 +254,14 @@ struct tx
 	} while (0)
 
 /* Attempt to perform a full checkpoint on the given database, but fail. */
-#define CHECKPOINT_FAIL(DB, RV)                                              \
-	do {                                                                 \
-		int _size;                                                   \
-		int _ckpt;                                                   \
-		int _rv;                                                     \
-		_rv = sqlite3_wal_checkpoint_v2(                             \
-		    DB, "main", SQLITE_CHECKPOINT_TRUNCATE, &_size, &_ckpt); \
-		munit_assert_int(_rv, ==, RV);                               \
+#define CHECKPOINT_FAIL(DB, RV)                                            \
+	do {                                                               \
+		int _size;                                                 \
+		int _ckpt;                                                 \
+		int _rv;                                                   \
+		_rv = sqlite3_wal_checkpoint_v2(                           \
+		    DB, NULL, SQLITE_CHECKPOINT_TRUNCATE, &_size, &_ckpt); \
+		munit_assert_int(_rv, ==, RV);                             \
 	} while (0)
 
 struct snapshot
@@ -477,7 +443,7 @@ TEST(vfs_extra, pollAfterWriteTransaction, setUp, tearDown, 0, vfs_params)
 {
 	sqlite3 *db;
 	sqlite3_stmt *stmt;
-	struct tx tx;
+	struct vfsTransaction tx;
 	unsigned i;
 
 	OPEN("1", db);
@@ -485,11 +451,12 @@ TEST(vfs_extra, pollAfterWriteTransaction, setUp, tearDown, 0, vfs_params)
 	PREPARE(db, stmt, "CREATE TABLE test(n INT)");
 	STEP(stmt, SQLITE_DONE);
 
-	POLL("1", tx);
+	POLL(db, tx);
 
-	munit_assert_ptr_not_null(tx.frames);
-	munit_assert_int(tx.n, ==, 2);
-	for (i = 0; i < tx.n; i++) {
+	munit_assert_ptr_not_null(tx.pages);
+	munit_assert_ptr_not_null(tx.page_numbers);
+	munit_assert_int(tx.n_pages, ==, 2);
+	for (i = 0; i < tx.n_pages; i++) {
 		munit_assert_int(tx.page_numbers[i], ==, i + 1);
 	}
 
@@ -511,7 +478,7 @@ TEST(vfs_extra, pollAcquireWriteLock, setUp, tearDown, 0, vfs_params)
 	sqlite3 *db2;
 	sqlite3_stmt *stmt1;
 	sqlite3_stmt *stmt2;
-	struct tx tx;
+	struct vfsTransaction tx;
 
 	OPEN("1", db1);
 	OPEN("1", db2);
@@ -520,7 +487,7 @@ TEST(vfs_extra, pollAcquireWriteLock, setUp, tearDown, 0, vfs_params)
 	PREPARE(db2, stmt2, "CREATE TABLE test2(n INT)");
 
 	STEP(stmt1, SQLITE_DONE);
-	POLL("1", tx);
+	POLL(db1, tx);
 
 	STEP(stmt2, SQLITE_BUSY);
 	RESET(stmt2, SQLITE_BUSY);
@@ -544,7 +511,7 @@ TEST(vfs_extra, pollAfterPageStress, setUp, tearDown, 0, vfs_params)
 {
 	sqlite3 *db;
 	sqlite3_stmt *stmt;
-	struct tx tx;
+	struct vfsTransaction tx;
 	unsigned i;
 	char sql[64];
 
@@ -552,37 +519,37 @@ TEST(vfs_extra, pollAfterPageStress, setUp, tearDown, 0, vfs_params)
 
 	EXEC(db, "CREATE TABLE test(n INT)");
 
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(db, tx);
+	APPLY(db, tx);
 	DONE(tx);
 
 	EXEC(db, "BEGIN");
 	for (i = 0; i < 163; i++) {
 		sprintf(sql, "INSERT INTO test(n) VALUES(%d)", i + 1);
 		EXEC(db, sql);
-		POLL("1", tx);
-		munit_assert_int(tx.n, ==, 0);
+		POLL(db, tx);
+		munit_assert_int(tx.n_pages, ==, 0);
 	}
 	for (i = 0; i < 163; i++) {
 		sprintf(sql, "UPDATE test SET n=%d WHERE n=%d", i, i + 1);
 		EXEC(db, sql);
-		POLL("1", tx);
-		munit_assert_int(tx.n, ==, 0);
+		POLL(db, tx);
+		munit_assert_int(tx.n_pages, ==, 0);
 	}
 	EXEC(db, "COMMIT");
 
-	POLL("1", tx);
+	POLL(db, tx);
 
 	/* Five frames were replicated and the first frame actually contains a
 	 * spill of the third page. */
-	munit_assert_int(tx.n, ==, 6);
+	munit_assert_int(tx.n_pages, ==, 6);
 	munit_assert_int(tx.page_numbers[0], ==, 3);
 	munit_assert_int(tx.page_numbers[1], ==, 4);
 	munit_assert_int(tx.page_numbers[2], ==, 5);
 	munit_assert_int(tx.page_numbers[3], ==, 1);
 	munit_assert_int(tx.page_numbers[4], ==, 2);
 
-	APPLY("1", tx);
+	APPLY(db, tx);
 	DONE(tx);
 
 	/* All records have been inserted. */
@@ -606,7 +573,7 @@ TEST(vfs_extra, adaptPendingByte, setUp, tearDownRestorePendingByte, 0, vfs_para
 {
 	sqlite3 *db;
 	sqlite3_stmt *stmt;
-	struct tx tx;
+	struct vfsTransaction tx;
 	int i;
 	int n;
 	char sql[64];
@@ -620,8 +587,8 @@ TEST(vfs_extra, adaptPendingByte, setUp, tearDownRestorePendingByte, 0, vfs_para
 
 	EXEC(db, "CREATE TABLE test(n INT)");
 
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(db, tx);
+	APPLY(db, tx);
 	DONE(tx);
 
 	EXEC(db, "BEGIN");
@@ -629,13 +596,13 @@ TEST(vfs_extra, adaptPendingByte, setUp, tearDownRestorePendingByte, 0, vfs_para
 	for (i = 0; i < n; i++) {
 		sprintf(sql, "INSERT INTO test(n) VALUES(%d)", i);
 		EXEC(db, sql);
-		POLL("1", tx);
-		munit_assert_uint(tx.n, ==, 0);
+		POLL(db, tx);
+		munit_assert_uint(tx.n_pages, ==, 0);
 	}
 	EXEC(db, "COMMIT");
 
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(db, tx);
+	APPLY(db, tx);
 	DONE(tx);
 
 	/* All records have been inserted. */
@@ -659,14 +626,14 @@ TEST(vfs_extra, applyMakesTransactionVisible, setUp, tearDown, 0, vfs_params)
 {
 	sqlite3 *db;
 	sqlite3_stmt *stmt;
-	struct tx tx;
+	struct vfsTransaction tx;
 
 	OPEN("1", db);
 
 	EXEC(db, "CREATE TABLE test(n INT)");
 
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(db, tx);
+	APPLY(db, tx);
 	DONE(tx);
 
 	PREPARE(db, stmt, "SELECT * FROM test");
@@ -685,27 +652,27 @@ TEST(vfs_extra, applyExplicitTransaction, setUp, tearDown, 0, vfs_params)
 {
 	sqlite3 *db;
 	sqlite3_stmt *stmt;
-	struct tx tx;
+	struct vfsTransaction tx;
 
 	OPEN("1", db);
 
 	PREPARE(db, stmt, "BEGIN");
 	STEP(stmt, SQLITE_DONE);
-	POLL("1", tx);
-	munit_assert_int(tx.n, ==, 0);
+	POLL(db, tx);
+	munit_assert_int(tx.n_pages, ==, 0);
 	FINALIZE(stmt);
 
 	PREPARE(db, stmt, "CREATE TABLE test(n INT)");
 	STEP(stmt, SQLITE_DONE);
-	POLL("1", tx);
-	munit_assert_int(tx.n, ==, 0);
+	POLL(db, tx);
+	munit_assert_int(tx.n_pages, ==, 0);
 	FINALIZE(stmt);
 
 	PREPARE(db, stmt, "COMMIT");
 	STEP(stmt, SQLITE_DONE);
-	POLL("1", tx);
-	munit_assert_int(tx.n, ==, 2);
-	APPLY("1", tx);
+	POLL(db, tx);
+	munit_assert_int(tx.n_pages, ==, 2);
+	APPLY(db, tx);
 	DONE(tx);
 	FINALIZE(stmt);
 
@@ -725,20 +692,20 @@ TEST(vfs_extra, consecutiveWriteTransactions, setUp, tearDown, 0, vfs_params)
 {
 	sqlite3 *db;
 	sqlite3_stmt *stmt;
-	struct tx tx;
+	struct vfsTransaction tx;
 
 	OPEN("1", db);
 
 	EXEC(db, "CREATE TABLE test(n INT)");
 
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(db, tx);
+	APPLY(db, tx);
 	DONE(tx);
 
 	EXEC(db, "INSERT INTO test(n) VALUES(123)");
 
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(db, tx);
+	APPLY(db, tx);
 	DONE(tx);
 
 	PREPARE(db, stmt, "SELECT * FROM test");
@@ -765,23 +732,23 @@ TEST(vfs_extra,
 {
 	sqlite3 *db;
 	sqlite3_stmt *stmt;
-	struct tx tx;
+	struct vfsTransaction tx;
 
 	OPEN("1", db);
 
 	EXEC(db, "CREATE TABLE foo(id INT)");
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(db, tx);
+	APPLY(db, tx);
 	DONE(tx);
 
 	EXEC(db, "CREATE TABLE bar (id INT)");
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(db, tx);
+	APPLY(db, tx);
 	DONE(tx);
 
 	EXEC(db, "INSERT INTO foo(id) VALUES(1)");
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(db, tx);
+	APPLY(db, tx);
 	DONE(tx);
 
 	CLOSE(db);
@@ -810,15 +777,15 @@ TEST(vfs_extra,
 	sqlite3 *db1;
 	sqlite3 *db2;
 	sqlite3_stmt *stmt;
-	struct tx tx;
+	struct vfsTransaction tx;
 
 	OPEN("1", db1);
 	OPEN("1", db2);
 
 	EXEC(db1, "CREATE TABLE test(n INT)");
 
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(db1, tx);
+	APPLY(db1, tx);
 	DONE(tx);
 
 	PREPARE(db2, stmt, "SELECT * FROM test");
@@ -839,14 +806,14 @@ TEST(vfs_extra, transactionIsVisibleFromNewConnection, setUp, tearDown, 0, vfs_p
 	sqlite3 *db1;
 	sqlite3 *db2;
 	sqlite3_stmt *stmt;
-	struct tx tx;
+	struct vfsTransaction tx;
 
 	OPEN("1", db1);
 
 	EXEC(db1, "CREATE TABLE test(n INT)");
 
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(db1, tx);
+	APPLY(db1, tx);
 	DONE(tx);
 
 	OPEN("1", db2);
@@ -874,14 +841,14 @@ TEST(vfs_extra,
 {
 	sqlite3 *db;
 	sqlite3_stmt *stmt;
-	struct tx tx;
+	struct vfsTransaction tx;
 
 	OPEN("1", db);
 
 	EXEC(db, "CREATE TABLE test(n INT)");
 
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(db, tx);
+	APPLY(db, tx);
 	DONE(tx);
 
 	CLOSE(db);
@@ -904,20 +871,18 @@ TEST(vfs_extra, firstApplyOnDifferentVfs, setUp, tearDown, 0, vfs_params)
 	sqlite3 *db1;
 	sqlite3 *db2;
 	sqlite3_stmt *stmt;
-	struct tx tx;
+	struct vfsTransaction tx;
 
 	OPEN("1", db1);
 
 	PREPARE(db1, stmt, "CREATE TABLE test(n INT)");
 	STEP(stmt, SQLITE_DONE);
-
-	POLL("1", tx);
-
-	APPLY("1", tx);
+	POLL(db1, tx);
+	APPLY(db1, tx);
 
 	OPEN("2", db2);
+	APPLY(db2, tx);
 	CLOSE(db2);
-	APPLY("2", tx);
 
 	DONE(tx);
 
@@ -934,29 +899,27 @@ TEST(vfs_extra, secondApplyOnDifferentVfs, setUp, tearDown, 0, vfs_params)
 {
 	sqlite3 *db1;
 	sqlite3 *db2;
-	struct tx tx;
+	struct vfsTransaction tx;
 
 	OPEN("1", db1);
 
 	EXEC(db1, "CREATE TABLE test(n INT)");
-
-	POLL("1", tx);
-
-	APPLY("1", tx);
+	POLL(db1, tx);
+	APPLY(db1, tx);
 
 	OPEN("2", db2);
-	CLOSE(db2);
-	APPLY("2", tx);
+	APPLY(db2, tx);
 
 	DONE(tx);
 
 	EXEC(db1, "INSERT INTO test(n) VALUES(123)");
 
-	POLL("1", tx);
-	APPLY("1", tx);
-	APPLY("2", tx);
+	POLL(db1, tx);
+	APPLY(db1, tx);
+	APPLY(db2, tx);
 	DONE(tx);
 
+	CLOSE(db2);
 	CLOSE(db1);
 
 	return MUNIT_OK;
@@ -970,32 +933,30 @@ TEST(vfs_extra, applyOnDifferentVfsWithOpenConnection, setUp, tearDown, 0, vfs_p
 	sqlite3 *db1;
 	sqlite3 *db2;
 	sqlite3_stmt *stmt;
-	struct tx tx;
+	struct vfsTransaction tx;
 
 	OPEN("1", db1);
 
 	PREPARE(db1, stmt, "CREATE TABLE test(n INT)");
 	STEP(stmt, SQLITE_DONE);
 	FINALIZE(stmt);
+	POLL(db1, tx);
+	APPLY(db1, tx);
 
-	POLL("1", tx);
-	APPLY("1", tx);
 	OPEN("2", db2);
+	APPLY(db2, tx);
 	CLOSE(db2);
-	APPLY("2", tx);
 	DONE(tx);
 
 	EXEC(db1, "INSERT INTO test(n) VALUES(123)");
-
-	POLL("1", tx);
-
+	POLL(db1, tx);
 	CLOSE(db1);
 
 	OPEN("2", db2);
 	PREPARE(db2, stmt, "PRAGMA cache_size=-5000");
 	FINALIZE(stmt);
 
-	APPLY("2", tx);
+	APPLY(db2, tx);
 
 	PREPARE(db2, stmt, "SELECT * FROM test");
 	STEP(stmt, SQLITE_ROW);
@@ -1015,17 +976,17 @@ TEST(vfs_extra, transactionVisibleOnDifferentVfs, setUp, tearDown, 0, vfs_params
 	sqlite3 *db1;
 	sqlite3 *db2;
 	sqlite3_stmt *stmt;
-	struct tx tx;
+	struct vfsTransaction tx;
 
 	OPEN("1", db1);
 
 	EXEC(db1, "CREATE TABLE test(n INT)");
 
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(db1, tx);
+	APPLY(db1, tx);
 	OPEN("2", db2);
+	APPLY(db2, tx);
 	CLOSE(db2);
-	APPLY("2", tx);
 	DONE(tx);
 
 	CLOSE(db1);
@@ -1047,7 +1008,7 @@ TEST(vfs_extra, abort, setUp, tearDown, 0, vfs_params)
 	sqlite3 *db2;
 	sqlite3_stmt *stmt1;
 	sqlite3_stmt *stmt2;
-	struct tx tx;
+	struct vfsTransaction tx;
 
 	OPEN("1", db1);
 	OPEN("1", db2);
@@ -1056,8 +1017,8 @@ TEST(vfs_extra, abort, setUp, tearDown, 0, vfs_params)
 	PREPARE(db2, stmt2, "CREATE TABLE test2(n INT)");
 
 	STEP(stmt1, SQLITE_DONE);
-	POLL("1", tx);
-	ABORT("1");
+	POLL(db1, tx);
+	ABORT(db1);
 
 	STEP(stmt2, SQLITE_DONE);
 
@@ -1080,17 +1041,17 @@ TEST(vfs_extra, checkpoint, setUp, tearDown, 0, vfs_params)
 	sqlite3 *db1;
 	sqlite3 *db2;
 	sqlite3_stmt *stmt;
-	struct tx tx;
+	struct vfsTransaction tx;
 
 	OPEN("1", db1);
 
 	EXEC(db1, "CREATE TABLE test(n INT)");
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(db1, tx);
+	APPLY(db1, tx);
 	DONE(tx);
 	EXEC(db1, "INSERT INTO test(n) VALUES(123)");
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(db1, tx);
+	APPLY(db1, tx);
 	DONE(tx);
 
 	OPEN("1", db2);
@@ -1098,8 +1059,8 @@ TEST(vfs_extra, checkpoint, setUp, tearDown, 0, vfs_params)
 	CLOSE(db2);
 
 	EXEC(db1, "INSERT INTO test(n) VALUES(456)");
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(db1, tx);
+	APPLY(db1, tx);
 	DONE(tx);
 
 	PREPARE(db1, stmt, "SELECT * FROM test");
@@ -1118,24 +1079,25 @@ TEST(vfs_extra, checkpoint, setUp, tearDown, 0, vfs_params)
 TEST(vfs_extra, checkpointReclaimsSpace, setUp, tearDown, 0, vfs_params)
 {
 	sqlite3 *conn;
-	struct tx tx;
+	struct vfsTransaction tx;
 	struct sqlite3_file *main_f;
 	sqlite3_int64 pre_vacuum_size, post_vacuum_size;
 	int rv;
 
 
 	OPEN("1", conn);
-	rv = sqlite3_file_control(conn, "main", SQLITE_FCNTL_FILE_POINTER, &main_f);
+	rv = sqlite3_file_control(conn, NULL, SQLITE_FCNTL_FILE_POINTER,
+				  &main_f);
 	assert(rv == SQLITE_OK);
 
 	EXEC(conn, "CREATE TABLE test(n INT)");
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(conn, tx);
+	APPLY(conn, tx);
 	DONE(tx);
 
 	EXEC(conn, "DROP TABLE test");
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(conn, tx);
+	APPLY(conn, tx);
 	DONE(tx);
 	CHECKPOINT(conn);
 
@@ -1143,8 +1105,8 @@ TEST(vfs_extra, checkpointReclaimsSpace, setUp, tearDown, 0, vfs_params)
 	assert(rv == SQLITE_OK);
 
 	EXEC(conn, "VACUUM");
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(conn, tx);
+	APPLY(conn, tx);
 	DONE(tx);
 
 	CHECKPOINT(conn);
@@ -1162,7 +1124,7 @@ TEST(vfs_extra, applyOnDifferentVfsCheckpointReclaimsSpace, setUp, tearDown, 0, 
 {
 	sqlite3 *db1;
 	sqlite3 *db2;
-	struct tx tx;
+	struct vfsTransaction tx;
 	struct sqlite3_file *main_f;
 	sqlite3_int64 pre_vacuum_size, post_vacuum_size;
 	int rv;
@@ -1170,22 +1132,23 @@ TEST(vfs_extra, applyOnDifferentVfsCheckpointReclaimsSpace, setUp, tearDown, 0, 
 
 	OPEN("1", db1);
 	OPEN("2", db2);
-	CLOSE(db2);
 
 	EXEC(db1, "CREATE TABLE test(n INT)");
-	POLL("1", tx);
-	APPLY("1", tx);
-	APPLY("2", tx);
+	POLL(db1, tx);
+	APPLY(db1, tx);
+	APPLY(db2, tx);
 	DONE(tx);
 
 	EXEC(db1, "DROP TABLE test");
-	POLL("1", tx);
-	APPLY("1", tx);
-	APPLY("2", tx);
+	POLL(db1, tx);
+	APPLY(db1, tx);
+	APPLY(db2, tx);
 	DONE(tx);
+	CLOSE(db2);
 
 	OPEN("2", db2);
-	rv = sqlite3_file_control(db2, "main", SQLITE_FCNTL_FILE_POINTER, &main_f);
+	rv =
+	    sqlite3_file_control(db2, NULL, SQLITE_FCNTL_FILE_POINTER, &main_f);
 	assert(rv == SQLITE_OK);
 	CHECKPOINT(db2);
 
@@ -1193,9 +1156,9 @@ TEST(vfs_extra, applyOnDifferentVfsCheckpointReclaimsSpace, setUp, tearDown, 0, 
 	assert(rv == SQLITE_OK);
 
 	EXEC(db1, "VACUUM");
-	POLL("1", tx);
-	APPLY("1", tx);
-	APPLY("2", tx);
+	POLL(db1, tx);
+	APPLY(db1, tx);
+	APPLY(db2, tx);
 	DONE(tx);
 
 	CHECKPOINT(db2);
@@ -1210,44 +1173,41 @@ TEST(vfs_extra, applyOnDifferentVfsCheckpointReclaimsSpace, setUp, tearDown, 0, 
 	return MUNIT_OK;
 }
 
-
 /* Replicate a write transaction that happens after a checkpoint. */
 TEST(vfs_extra, applyOnDifferentVfsAfterCheckpoint, setUp, tearDown, 0, vfs_params)
 {
 	sqlite3 *db;
 	sqlite3_stmt *stmt;
-	struct tx tx1;
-	struct tx tx2;
-	struct tx tx3;
+	struct vfsTransaction tx1;
+	struct vfsTransaction tx2;
+	struct vfsTransaction tx3;
 
 	OPEN("1", db);
 
 	EXEC(db, "CREATE TABLE test(n INT)");
-	POLL("1", tx1);
-	APPLY("1", tx1);
+	POLL(db, tx1);
+	APPLY(db, tx1);
 	EXEC(db, "INSERT INTO test(n) VALUES(123)");
-	POLL("1", tx2);
-	APPLY("1", tx2);
+	POLL(db, tx2);
+	APPLY(db, tx2);
 
 	CHECKPOINT(db);
 
 	EXEC(db, "INSERT INTO test(n) VALUES(456)");
-	POLL("1", tx3);
-	APPLY("1", tx3);
+	POLL(db, tx3);
+	APPLY(db, tx3);
 
 	CLOSE(db);
 
 	OPEN("2", db);
+	APPLY(db, tx1);
+	APPLY(db, tx2);
 	CLOSE(db);
-
-	APPLY("2", tx1);
-	APPLY("2", tx2);
 
 	OPEN("2", db);
 	CHECKPOINT(db);
+	APPLY(db, tx3);
 	CLOSE(db);
-
-	APPLY("2", tx3);
 
 	OPEN("2", db);
 	PREPARE(db, stmt, "SELECT * FROM test ORDER BY n");
@@ -1277,32 +1237,32 @@ TEST(vfs_extra,
 {
 	sqlite3 *db;
 	sqlite3_stmt *stmt;
-	struct tx tx1;
-	struct tx tx2;
-	struct tx tx3;
-	struct tx tx4;
+	struct vfsTransaction tx1;
+	struct vfsTransaction tx2;
+	struct vfsTransaction tx3;
+	struct vfsTransaction tx4;
 
 	/* Create transactions and checkpoint the DB after every transaction */
 	OPEN("1", db);
 
 	EXEC(db, "CREATE TABLE test(n INT)");
-	POLL("1", tx1);
-	APPLY("1", tx1);
+	POLL(db, tx1);
+	APPLY(db, tx1);
 	CHECKPOINT_FRESH("1");
 
 	EXEC(db, "CREATE TABLE test2(n INT)");
-	POLL("1", tx2);
-	APPLY("1", tx2);
+	POLL(db, tx2);
+	APPLY(db, tx2);
 	CHECKPOINT_FRESH("1");
 
 	EXEC(db, "INSERT INTO test(n) VALUES(123)");
-	POLL("1", tx3);
-	APPLY("1", tx3);
+	POLL(db, tx3);
+	APPLY(db, tx3);
 	CHECKPOINT_FRESH("1");
 
 	EXEC(db, "INSERT INTO test2(n) VALUES(456)");
-	POLL("1", tx4);
-	APPLY("1", tx4);
+	POLL(db, tx4);
+	APPLY(db, tx4);
 	CHECKPOINT_FRESH("1");
 
 	CLOSE(db);
@@ -1311,10 +1271,10 @@ TEST(vfs_extra,
 	 * the DB in between. */
 	OPEN("2", db);
 
-	APPLY("2", tx1);
-	APPLY("2", tx2);
-	APPLY("2", tx3);
-	APPLY("2", tx4);
+	APPLY(db, tx1);
+	APPLY(db, tx2);
+	APPLY(db, tx3);
+	APPLY(db, tx4);
 
 	/* Ensure data is there. */
 	PREPARE(db, stmt, "SELECT * FROM test ORDER BY n");
@@ -1352,45 +1312,44 @@ TEST(vfs_extra,
 {
 	sqlite3 *db;
 	sqlite3_stmt *stmt;
-	struct tx tx1;
-	struct tx tx2;
-	struct tx tx3;
-	struct tx tx4;
+	struct vfsTransaction tx1;
+	struct vfsTransaction tx2;
+	struct vfsTransaction tx3;
+	struct vfsTransaction tx4;
 
 	/* Create transactions */
 	OPEN("1", db);
 
 	EXEC(db, "CREATE TABLE test(n INT)");
-	POLL("1", tx1);
-	APPLY("1", tx1);
+	POLL(db, tx1);
+	APPLY(db, tx1);
 
 	EXEC(db, "CREATE TABLE test2(n INT)");
-	POLL("1", tx2);
-	APPLY("1", tx2);
+	POLL(db, tx2);
+	APPLY(db, tx2);
 
 	EXEC(db, "INSERT INTO test(n) VALUES(123)");
-	POLL("1", tx3);
-	APPLY("1", tx3);
+	POLL(db, tx3);
+	APPLY(db, tx3);
 
 	EXEC(db, "INSERT INTO test2(n) VALUES(456)");
-	POLL("1", tx4);
-	APPLY("1", tx4);
+	POLL(db, tx4);
+	APPLY(db, tx4);
 
 	CLOSE(db);
 
 	/* Create a second VFS and Apply the transactions while checkpointing
 	 * after every transaction. */
 	OPEN("2", db);
+	APPLY(db, tx1);
+	CHECKPOINT_FRESH("2");
+	APPLY(db, tx2);
+	CHECKPOINT_FRESH("2");
+	APPLY(db, tx3);
+	CHECKPOINT_FRESH("2");
+	APPLY(db, tx4);
+	CHECKPOINT_FRESH("2");
 	CLOSE(db);
-
-	APPLY("2", tx1);
-	CHECKPOINT_FRESH("2");
-	APPLY("2", tx2);
-	CHECKPOINT_FRESH("2");
-	APPLY("2", tx3);
-	CHECKPOINT_FRESH("2");
-	APPLY("2", tx4);
-	CHECKPOINT_FRESH("2");
 
 	/* Ensure all the data is there. */
 	OPEN("2", db);
@@ -1421,47 +1380,47 @@ TEST(vfs_extra,
  * perform a new write transaction on that other VFS. */
 TEST(vfs_extra, checkpointThenPerformTransaction, setUp, tearDown, 0, vfs_params)
 {
-	sqlite3 *db1;
-	struct tx tx1;
-	struct tx tx2;
-	struct tx tx3;
+	sqlite3 *db;
+	struct vfsTransaction tx1;
+	struct vfsTransaction tx2;
+	struct vfsTransaction tx3;
 
-	OPEN("1", db1);
+	OPEN("1", db);
 
-	EXEC(db1, "CREATE TABLE test(n INT)");
-	POLL("1", tx1);
-	APPLY("1", tx1);
-	EXEC(db1, "INSERT INTO test(n) VALUES(123)");
-	POLL("1", tx2);
-	APPLY("1", tx2);
+	EXEC(db, "CREATE TABLE test(n INT)");
+	POLL(db, tx1);
+	APPLY(db, tx1);
+	EXEC(db, "INSERT INTO test(n) VALUES(123)");
+	POLL(db, tx2);
+	APPLY(db, tx2);
 
-	CHECKPOINT(db1);
+	CHECKPOINT(db);
 
-	EXEC(db1, "INSERT INTO test(n) VALUES(456)");
-	POLL("1", tx3);
-	APPLY("1", tx3);
+	EXEC(db, "INSERT INTO test(n) VALUES(456)");
+	POLL(db, tx3);
+	APPLY(db, tx3);
 
-	CLOSE(db1);
+	CLOSE(db);
 
-	OPEN("2", db1);
+	OPEN("2", db);
 
-	APPLY("2", tx1);
-	APPLY("2", tx2);
+	APPLY(db, tx1);
+	APPLY(db, tx2);
 
 	CHECKPOINT_FRESH("2");
 
-	APPLY("2", tx3);
+	APPLY(db, tx3);
 
 	DONE(tx1);
 	DONE(tx2);
 	DONE(tx3);
 
-	EXEC(db1, "INSERT INTO test(n) VALUES(789)");
-	POLL("2", tx1);
-	APPLY("2", tx1);
+	EXEC(db, "INSERT INTO test(n) VALUES(789)");
+	POLL(db, tx1);
+	APPLY(db, tx1);
 	DONE(tx1);
 
-	CLOSE(db1);
+	CLOSE(db);
 
 	return MUNIT_OK;
 }
@@ -1471,30 +1430,30 @@ TEST(vfs_extra, checkpointThenPerformTransaction, setUp, tearDown, 0, vfs_params
 TEST(vfs_extra, rollbackTransactionWithoutPageStress, setUp, tearDown, 0, vfs_params)
 {
 	sqlite3 *db;
-	struct tx tx;
+	struct vfsTransaction tx;
 	sqlite3_stmt *stmt;
 
 	OPEN("1", db);
 	EXEC(db, "CREATE TABLE test(n INT)");
 
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(db, tx);
+	APPLY(db, tx);
 	DONE(tx);
 
 	EXEC(db, "BEGIN");
 	EXEC(db, "INSERT INTO test(n) VALUES(1)");
 	EXEC(db, "ROLLBACK");
 
-	POLL("1", tx);
-	munit_assert_int(tx.n, ==, 0);
+	POLL(db, tx);
+	munit_assert_int(tx.n_pages, ==, 0);
 
 	PREPARE(db, stmt, "SELECT * FROM test");
 	STEP(stmt, SQLITE_DONE);
 	RESET(stmt, SQLITE_OK);
 
 	EXEC(db, "INSERT INTO test(n) VALUES(1)");
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(db, tx);
+	APPLY(db, tx);
 	DONE(tx);
 
 	STEP(stmt, SQLITE_ROW);
@@ -1512,15 +1471,15 @@ TEST(vfs_extra, rollbackTransactionWithPageStress, setUp, tearDown, 0, vfs_param
 {
 	sqlite3 *db;
 	sqlite3_stmt *stmt;
-	struct tx tx;
+	struct vfsTransaction tx;
 	unsigned i;
 
 	OPEN("1", db);
 
 	EXEC(db, "CREATE TABLE test(n INT)");
 
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(db, tx);
+	APPLY(db, tx);
 	DONE(tx);
 
 	EXEC(db, "BEGIN");
@@ -1528,20 +1487,20 @@ TEST(vfs_extra, rollbackTransactionWithPageStress, setUp, tearDown, 0, vfs_param
 		char sql[64];
 		sprintf(sql, "INSERT INTO test(n) VALUES(%d)", i + 1);
 		EXEC(db, sql);
-		POLL("1", tx);
-		munit_assert_int(tx.n, ==, 0);
+		POLL(db, tx);
+		munit_assert_int(tx.n_pages, ==, 0);
 	}
 	EXEC(db, "ROLLBACK");
 
-	POLL("1", tx);
-	munit_assert_int(tx.n, ==, 0);
+	POLL(db, tx);
+	munit_assert_int(tx.n_pages, ==, 0);
 	PREPARE(db, stmt, "SELECT * FROM test");
 	STEP(stmt, SQLITE_DONE);
 	RESET(stmt, SQLITE_OK);
 
 	EXEC(db, "INSERT INTO test(n) VALUES(1)");
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(db, tx);
+	APPLY(db, tx);
 	DONE(tx);
 
 	STEP(stmt, SQLITE_ROW);
@@ -1558,15 +1517,15 @@ TEST(vfs_extra, rollbackTransactionWithPageStress, setUp, tearDown, 0, vfs_param
 TEST(vfs_extra, checkpointTransactionWithPageStress, setUp, tearDown, 0, vfs_params)
 {
 	sqlite3 *db;
-	struct tx tx;
+	struct vfsTransaction tx;
 	unsigned i;
 
 	OPEN("1", db);
 
 	EXEC(db, "CREATE TABLE test(n INT)");
 
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(db, tx);
+	APPLY(db, tx);
 	DONE(tx);
 
 	EXEC(db, "BEGIN");
@@ -1574,8 +1533,8 @@ TEST(vfs_extra, checkpointTransactionWithPageStress, setUp, tearDown, 0, vfs_par
 		char sql[64];
 		sprintf(sql, "INSERT INTO test(n) VALUES(%d)", i + 1);
 		EXEC(db, sql);
-		POLL("1", tx);
-		munit_assert_int(tx.n, ==, 0);
+		POLL(db, tx);
+		munit_assert_int(tx.n_pages, ==, 0);
 	}
 
 	CHECKPOINT_FAIL(db, SQLITE_LOCKED);
@@ -1617,7 +1576,7 @@ TEST(vfs_extra, snapshotAfterFirstTransaction, setUp, tearDown, 0, vfs_params)
 {
 	sqlite3 *db;
 	struct snapshot snapshot;
-	struct tx tx;
+	struct vfsTransaction tx;
 	uint8_t *page;
 	uint32_t db_pages;
 	uint32_t wal_pages;
@@ -1627,8 +1586,8 @@ TEST(vfs_extra, snapshotAfterFirstTransaction, setUp, tearDown, 0, vfs_params)
 	OPEN("1", db);
 	EXEC(db, "CREATE TABLE test(n INT)");
 
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(db, tx);
+	APPLY(db, tx);
 	DONE(tx);
 
 	CLOSE(db);
@@ -1667,7 +1626,7 @@ TEST(vfs_extra, snapshotAfterCheckpoint, setUp, tearDown, 0, vfs_params)
 {
 	sqlite3 *db;
 	struct snapshot snapshot;
-	struct tx tx;
+	struct vfsTransaction tx;
 	uint8_t *page;
 	uint8_t page_size[2] = {2, 0};           /* Big-endian page size */
 	uint8_t database_size[4] = {0, 0, 0, 2}; /* Big-endian database size */
@@ -1675,8 +1634,8 @@ TEST(vfs_extra, snapshotAfterCheckpoint, setUp, tearDown, 0, vfs_params)
 	OPEN("1", db);
 	EXEC(db, "CREATE TABLE test(n INT)");
 
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(db, tx);
+	APPLY(db, tx);
 	DONE(tx);
 
 	CHECKPOINT(db);
@@ -1725,13 +1684,13 @@ TEST(vfs_extra, restoreAfterFirstTransaction, setUp, tearDown, 0, vfs_params)
 	sqlite3 *db;
 	sqlite3_stmt *stmt;
 	struct snapshot snapshot;
-	struct tx tx;
+	struct vfsTransaction tx;
 
 	OPEN("1", db);
 	EXEC(db, "CREATE TABLE test(n INT)");
 
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(db, tx);
+	APPLY(db, tx);
 	DONE(tx);
 
 	CLOSE(db);
@@ -1762,13 +1721,12 @@ TEST(vfs_extra, restoreWithOpenConnection, setUp, tearDown, 0, vfs_params)
 	sqlite3 *db;
 	sqlite3_stmt *stmt;
 	struct snapshot snapshot;
-	struct tx tx;
+	struct vfsTransaction tx;
 
 	OPEN("1", db);
 	EXEC(db, "CREATE TABLE test(n INT)");
-
-	POLL("1", tx);
-	APPLY("1", tx);
+	POLL(db, tx);
+	APPLY(db, tx);
 	DONE(tx);
 
 	CLOSE(db);
