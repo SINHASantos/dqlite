@@ -1288,6 +1288,10 @@ struct raft_barrier
 {
 	RAFT__REQUEST;
 	raft_barrier_cb cb;
+
+	/* Singly linked list for bundled requests targetting the same raft
+	 * index. */
+	struct raft_barrier *next;
 };
 
 /**
@@ -2109,6 +2113,10 @@ RAFT_API void raft_fixture_set_send_latency(struct raft_fixture *f,
 					    unsigned i,
 					    unsigned j,
 					    unsigned msecs);
+
+RAFT_API void raft_fixture_set_work_duration(struct raft_fixture *f,
+					     unsigned i,
+					     unsigned msecs);
 
 /**
  * Set the persisted term of the @i'th server.

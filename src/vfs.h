@@ -18,22 +18,21 @@ int VfsEnableDisk(struct sqlite3_vfs *vfs);
  * SQLite global registry. */
 void VfsClose(struct sqlite3_vfs *vfs);
 
+struct vfsTransaction {
+	uint32_t    n_pages;      /* Number of pages in the transaction. */
+	uint64_t   *page_numbers; /* Page number for each page. */
+	void      **pages;        /* Content of the pages. */
+};
+
 /* Check if the last sqlite3_step() call triggered a write transaction, and
  * return its content if so. */
-int VfsPoll(sqlite3_vfs *vfs,
-	    const char *database,
-	    dqlite_vfs_frame **frames,
-	    unsigned *n);
+int VfsPoll(sqlite3 *conn, struct vfsTransaction *transaction);
 
-/* Append the given frames to the WAL. */
-int VfsApply(sqlite3_vfs *vfs,
-	     const char *filename,
-	     unsigned n,
-	     unsigned long *page_numbers,
-	     void *frames);
+/* Append the given transaction to the WAL. */
+int VfsApply(sqlite3 *conn, const struct vfsTransaction *transaction);
 
 /* Cancel a pending transaction. */
-int VfsAbort(sqlite3_vfs *vfs, const char *filename);
+int VfsAbort(sqlite3 *conn);
 
 /* Make a full snapshot of a database. */
 int VfsSnapshot(sqlite3_vfs *vfs, const char *filename, void **data, size_t *n);

@@ -105,6 +105,11 @@ static void handleCb(struct handle *req,
 	ctx->schema = schema;
 }
 
+static void barrierCb(struct raft_barrier *req, int status) {
+	(void)req;
+	(void)status;
+}
+
 /******************************************************************************
  *
  * Helper macros.
@@ -292,6 +297,14 @@ static void handleCb(struct handle *req,
 		FINALIZE(_stmt_id);             \
 	}
 
+/* Prepare and exec a statement. */
+#define EXEC_SQL(SQL)                       \
+	{                                   \
+		EXEC_SQL_SUBMIT(SQL);       \
+		WAIT;                       \
+		ASSERT_CALLBACK(0, RESULT); \
+	}
+
 /* Execute a pragma statement to lowers SQLite's page cache size, in order to
  * force it to write uncommitted dirty pages to the WAL and hance trigger calls
  * to the xFrames hook with non-commit batches. */
@@ -412,6 +425,7 @@ TEST_SETUP(open)
 {
 	struct open_fixture *f = munit_malloc(sizeof *f);
 	SETUP;
+	CLUSTER_ELECT(0);
 	return f;
 }
 TEST_TEAR_DOWN(open)
@@ -473,6 +487,7 @@ TEST_SETUP(prepare)
 {
 	struct prepare_fixture *f = munit_malloc(sizeof *f);
 	SETUP;
+	CLUSTER_ELECT(0);
 	OPEN;
 	return f;
 }
@@ -490,7 +505,6 @@ TEST_CASE(prepare, success, NULL)
 	(void)params;
 	f->request.db_id = 0;
 	f->request.sql = "CREATE TABLE test (n INT)";
-	CLUSTER_ELECT(0);
 	ENCODE(&f->request, prepare);
 	HANDLE(PREPARE);
 	WAIT;
@@ -507,7 +521,6 @@ TEST_CASE(prepare, empty1, NULL)
 	(void)params;
 	f->request.db_id = 0;
 	f->request.sql = "";
-	CLUSTER_ELECT(0);
 	ENCODE(&f->request, prepare);
 	HANDLE(PREPARE);
 	WAIT;
@@ -524,7 +537,6 @@ TEST_CASE(prepare, empty2, NULL)
 	(void)params;
 	f->request.db_id = 0;
 	f->request.sql = " -- This is a comment";
-	CLUSTER_ELECT(0);
 	ENCODE(&f->request, prepare);
 	HANDLE(PREPARE);
 	WAIT;
@@ -541,7 +553,6 @@ TEST_CASE(prepare, invalid, NULL)
 	(void)params;
 	f->request.db_id = 0;
 	f->request.sql = "NOT SQL";
-	CLUSTER_ELECT(0);
 	ENCODE(&f->request, prepare);
 	HANDLE(PREPARE);
 	WAIT;
@@ -560,7 +571,6 @@ TEST_CASE(prepare, closing, NULL)
 	f->request.db_id = 0;
 	f->request.sql = "CREATE TABLE test (n INT)";
 	ENCODE(&f->request, prepare);
-	CLUSTER_ELECT(0);
 	HANDLE(PREPARE);
 	return MUNIT_OK;
 }
@@ -569,28 +579,23 @@ TEST_CASE(prepare, closing, NULL)
 TEST_CASE(prepare, barrier_error, NULL)
 {
 	struct prepare_fixture *f = data;
-	uint64_t stmt_id;
 	(void)params;
 
-	/* Set up an uncommitted exec operation */
-	CLUSTER_ELECT(0);
-	PREPARE("CREATE TABLE test (n INT)");
-	EXEC_SUBMIT(stmt_id);
-	CLUSTER_DEPOSE;
-	ASSERT_CALLBACK(SQLITE_IOERR_LEADERSHIP_LOST, FAILURE);
+	CLUSTER_APPLIED(2);
 
-	/* Submit a prepare request, forcing a barrier, which fails */
-	CLUSTER_ELECT(0);
+	/* Send a barrier which will fail. */
+	struct raft_barrier faulty_barrier = {};
+	raft_fixture_append_fault(&f->cluster, 0, 0);
+	int rv = raft_barrier(CLUSTER_RAFT(0), &faulty_barrier, barrierCb);
+	munit_assert_int(rv, ==, 0);
+
 	f->request.db_id = 0;
-	f->request.sql = "SELECT n FROM test";
+	f->request.sql = "SELECT 1";
 	ENCODE(&f->request, prepare);
-	/* We rely on leader_exec (called by handle_prepare) attempting
-	 * an allocation using raft_malloc. */
-	test_raft_heap_fault_config(1, 1);
-	test_raft_heap_fault_enable();
-	HANDLE_STATUS(DQLITE_REQUEST_PREPARE, RAFT_SNAPSHOT_OK);
+	HANDLE_STATUS(DQLITE_REQUEST_PREPARE, RAFT_OK);
 	WAIT;
 	ASSERT_CALLBACK(SQLITE_IOERR, FAILURE);
+	ASSERT_FAILURE(SQLITE_IOERR, "leader exec failed");
 	return MUNIT_OK;
 }
 
@@ -600,7 +605,6 @@ TEST_CASE(prepare, non_leader, NULL)
 	struct prepare_fixture *f = data;
 	(void)params;
 
-	CLUSTER_ELECT(0);
 	SELECT(1);
 	f->request.db_id = 0;
 	f->request.sql = "CREATE TABLE test (n INT)";
@@ -619,7 +623,6 @@ TEST_CASE(prepare, nonempty_tail, NULL)
 	(void)params;
 	f->request.db_id = 0;
 	f->request.sql = "CREATE TABLE test (n INT); SELECT * FROM test";
-	CLUSTER_ELECT(0);
 	ENCODE(&f->request, prepare);
 	HANDLE(PREPARE);
 	WAIT;
@@ -635,7 +638,6 @@ TEST_CASE(prepare, comment_in_tail, NULL)
 	(void)params;
 	f->request.db_id = 0;
 	f->request.sql = "CREATE TABLE test (n INT); /* comment */";
-	CLUSTER_ELECT(0);
 	ENCODE(&f->request, prepare);
 	HANDLE(PREPARE);
 	WAIT;
@@ -655,7 +657,6 @@ TEST_CASE(prepare, nonempty_tail_v1, NULL)
 	(void)params;
 	f->request.db_id = 0;
 	f->request.sql = "CREATE TABLE test (n INT); SELECT * FROM test";
-	CLUSTER_ELECT(0);
 	ENCODE(&f->request, prepare);
 	HANDLE_SCHEMA_STATUS(DQLITE_REQUEST_PREPARE, 1, 0);
 	WAIT;
@@ -708,6 +709,7 @@ TEST_SETUP(exec)
 {
 	struct exec_fixture *f = munit_malloc(sizeof *f);
 	SETUP;
+	CLUSTER_ELECT(0);
 	OPEN;
 	return f;
 }
@@ -724,7 +726,6 @@ TEST_CASE(exec, simple, NULL)
 	struct exec_fixture *f = data;
 	uint64_t stmt_id;
 	(void)params;
-	CLUSTER_ELECT(0);
 	PREPARE("CREATE TABLE test (n INT)");
 	f->request.db_id = 0;
 	f->request.stmt_id = stmt_id;
@@ -745,7 +746,6 @@ TEST_CASE(exec, one_param, NULL)
 	struct value value;
 	uint64_t stmt_id;
 	(void)params;
-	CLUSTER_ELECT(0);
 
 	/* Create the test table */
 	EXEC("CREATE TABLE test (n INT)");
@@ -778,7 +778,6 @@ TEST_CASE(exec, blob, NULL)
 	uint64_t n;
 	const char *column;
 	(void)params;
-	CLUSTER_ELECT(0);
 
 	/* Create the test table */
 	EXEC("CREATE TABLE test (data BLOB)");
@@ -803,6 +802,7 @@ TEST_CASE(exec, blob, NULL)
 	query.stmt_id = stmt_id;
 	ENCODE(&query, query);
 	HANDLE(QUERY);
+	WAIT;
 	ASSERT_CALLBACK(0, ROWS);
 
 	uint64__decode(f->cursor, &n);
@@ -826,7 +826,6 @@ TEST_CASE(exec, frames_not_leader_1st_non_commit_re_elected, NULL)
 	uint64_t stmt_id;
 	unsigned i;
 	(void)params;
-	CLUSTER_ELECT(0);
 
 	/* Accumulate enough dirty data to fill the page cache */
 	LOWER_CACHE_SIZE;
@@ -859,7 +858,6 @@ TEST_CASE(exec, frames_not_leader_1st_non_commit_other_elected, NULL)
 	uint64_t stmt_id;
 	unsigned i;
 	(void)params;
-	CLUSTER_ELECT(0);
 
 	/* Accumulate enough dirty data to fill the page cache */
 	LOWER_CACHE_SIZE;
@@ -894,7 +892,6 @@ TEST_CASE(exec, frames_not_leader_2nd_non_commit_re_elected, NULL)
 	uint64_t stmt_id;
 	unsigned i;
 	(void)params;
-	CLUSTER_ELECT(0);
 
 	/* Accumulate enough dirty data to fill the page cache a first time,
 	 * flush it and then fill it a second time. */
@@ -926,7 +923,6 @@ TEST_CASE(exec, close_while_in_flight, NULL)
 	struct exec_fixture *f = data;
 	unsigned i;
 	(void)params;
-	CLUSTER_ELECT(0);
 
 	/* Accumulate enough dirty data to fill the page cache and trigger
 	 * an apply request. */
@@ -952,7 +948,6 @@ TEST_CASE(exec, frames_not_leader_2nd_non_commit_other_elected, NULL)
 	uint64_t stmt_id;
 	unsigned i;
 	(void)params;
-	CLUSTER_ELECT(0);
 
 	/* Accumulate enough dirty data to fill the page cache a first time,
 	 * flush it and then fill it a second time. */
@@ -987,7 +982,6 @@ TEST_CASE(exec, frames_leadership_lost_1st_non_commit_re_elected, NULL)
 	uint64_t stmt_id;
 	unsigned i;
 	(void)params;
-	CLUSTER_ELECT(0);
 
 	/* Accumulate enough dirty data to fill the page cache */
 	LOWER_CACHE_SIZE;
@@ -1022,7 +1016,6 @@ TEST_CASE(exec, undo_not_leader_pending_re_elected, NULL)
 	uint64_t stmt_id;
 	unsigned i;
 	(void)params;
-	CLUSTER_ELECT(0);
 
 	/* Accumulate enough dirty data to fill the page cache a first time */
 	LOWER_CACHE_SIZE;
@@ -1054,7 +1047,6 @@ TEST_CASE(exec, undo_not_leader_pending_other_elected, NULL)
 	uint64_t stmt_id;
 	unsigned i;
 	(void)params;
-	CLUSTER_ELECT(0);
 
 	/* Accumulate enough dirty data to fill the page cache a first time */
 	LOWER_CACHE_SIZE;
@@ -1080,6 +1072,127 @@ TEST_CASE(exec, undo_not_leader_pending_other_elected, NULL)
 	return MUNIT_OK;
 }
 
+/* Succesfully vacuum a database */
+TEST_CASE(exec, vacuum, NULL)
+{
+	struct exec_fixture *f = data;
+	uint64_t stmt_id;
+	(void)params;
+
+	/* Create some free pages */
+	LOWER_CACHE_SIZE;
+	EXEC("CREATE TABLE test (n INTEGER PRIMARY KEY NOT NULL)");
+	EXEC("WITH RECURSIVE seq(n) AS ("
+		"    SELECT 1 UNION ALL     "
+		"    SELECT n+1 FROM seq    "
+		"    WHERE  n < 10000       "
+		")                          "
+		"INSERT INTO test(n)        "
+		"SELECT n FROM seq          "
+	)
+	EXEC("DELETE FROM test WHERE n <= 5000");
+
+	PREPARE("VACUUM");
+	f->request.db_id = 0;
+	f->request.stmt_id = stmt_id;
+	ENCODE(&f->request, exec);
+	HANDLE(EXEC);
+	WAIT;
+	ASSERT_CALLBACK(0, RESULT);
+	DECODE(&f->response, result);
+	munit_assert_int(f->response.last_insert_id, ==, 10000);
+	munit_assert_int(f->response.rows_affected, ==,   5000);
+
+	/* Make sure that the freelist is now empty. */
+	struct value value;
+	uint64_t n;
+	text_t column;
+	QUERY_SQL_SUBMIT("PRAGMA freelist_count");
+	WAIT;
+	ASSERT_CALLBACK(0, ROWS);
+	uint64__decode(f->cursor, &n);
+	munit_assert_int(n, ==, 1);
+	text__decode(f->cursor, &column);
+	munit_assert_string_equal(column, "freelist_count");
+	DECODE_ROW(1, &value);
+	munit_assert_int(value.type, ==, SQLITE_INTEGER);
+	munit_assert_int(value.integer, ==, 0);
+	
+	return MUNIT_OK;
+}
+
+
+/* Succesfully vacuum a database */
+TEST_CASE(exec, vacuum_variants, NULL)
+{
+	struct exec_fixture *f = data;
+	uint64_t stmt_id;
+	(void)params;
+
+	LOWER_CACHE_SIZE;
+	EXEC("CREATE TABLE test (n INTEGER PRIMARY KEY NOT NULL)");
+	EXEC("WITH RECURSIVE seq(n) AS ("
+		"    SELECT 1 UNION ALL     "
+		"    SELECT n+1 FROM seq    "
+		"    WHERE  n < 10000       "
+		")                          "
+		"INSERT INTO test(n)        "
+		"SELECT n FROM seq          "
+	)
+
+	const char* vacuum_variants[] = {
+		" VACUUM \r\t\n ",
+		" VACUUM \r\t\n main \t\n",
+		" VACUUM \r\t\n 'main' \t\n",
+		" VACUUM \r\t\n \"main\" \t\n",
+	};
+	for (size_t i = 0; i < sizeof(vacuum_variants) / sizeof(vacuum_variants[0]); i++) {
+		/* Create some free pages */
+		EXEC("DELETE FROM test WHERE n < (SELECT MIN(n) + 1000 FROM test)");
+		PREPARE(vacuum_variants[i]);
+		f->request.db_id = 0;
+		f->request.stmt_id = stmt_id;
+		ENCODE(&f->request, exec);
+		HANDLE(EXEC);
+		WAIT;
+		ASSERT_CALLBACK(0, RESULT);
+		DECODE(&f->response, result);
+		munit_assert_int(f->response.last_insert_id, ==, 10000);
+		munit_assert_int(f->response.rows_affected, ==,   1000);
+	}
+	return MUNIT_OK;
+}
+
+/* Fail to vacuum into a file */
+TEST_CASE(exec, vacuum_into_fails, NULL)
+{
+	struct exec_fixture *f = data;
+	uint64_t stmt_id;
+	(void)params;
+
+	/* Create some free pages */
+	LOWER_CACHE_SIZE;
+	EXEC("CREATE TABLE test (n INTEGER PRIMARY KEY NOT NULL)");
+	EXEC("WITH RECURSIVE seq(n) AS ("
+		"    SELECT 1 UNION ALL     "
+		"    SELECT n+1 FROM seq    "
+		"    WHERE  n < 10000       "
+		")                          "
+		"INSERT INTO test(n)        "
+		"SELECT n FROM seq          "
+	)
+	EXEC("DELETE FROM test WHERE n <= 5000");
+
+	PREPARE("VACUUM INTO 'should_fail'");
+	f->request.db_id = 0;
+	f->request.stmt_id = stmt_id;
+	ENCODE(&f->request, exec);
+	HANDLE(EXEC);
+	WAIT;
+	ASSERT_CALLBACK(SQLITE_AUTH, FAILURE);
+	return MUNIT_OK;
+}
+
 /* A follower remains behind and needs to restore state from a snapshot. */
 TEST_CASE(exec, restore, NULL)
 {
@@ -1093,7 +1206,6 @@ TEST_CASE(exec, restore, NULL)
 	(void)params;
 	CLUSTER_SNAPSHOT_THRESHOLD(0, 5);
 	CLUSTER_SNAPSHOT_TRAILING(0, 2);
-	CLUSTER_ELECT(0);
 	CLUSTER_DISCONNECT(0, 1);
 	EXEC("CREATE TABLE test (n INT)");
 	EXEC("INSERT INTO test(n) VALUES(1)");
@@ -1129,6 +1241,34 @@ TEST_CASE(exec, restore, NULL)
 	return MUNIT_OK;
 }
 
+
+/* Submit a prepare request that triggers a failed barrier operation. */
+TEST_CASE(exec, barrier_error, NULL)
+{
+	struct exec_fixture *f = data;
+	uint64_t stmt_id;
+	(void)params;
+	CLUSTER_APPLIED(2);
+
+	PREPARE("CREATE TABLE test (n INT)");
+
+	/* Send a barrier which will fail. */
+	struct raft_barrier faulty_barrier = {};
+	raft_fixture_append_fault(&f->cluster, 0, 0);
+	int rv = raft_barrier(CLUSTER_RAFT(0), &faulty_barrier, barrierCb);
+	munit_assert_int(rv, ==, 0);
+
+	f->request.db_id = 0;
+	f->request.stmt_id = stmt_id;
+	ENCODE(&f->request, exec);
+	HANDLE_STATUS(DQLITE_REQUEST_EXEC, RAFT_OK);
+	WAIT;
+	ASSERT_CALLBACK(SQLITE_IOERR, FAILURE);
+	ASSERT_FAILURE(SQLITE_IOERR, "leader exec failed");
+
+	return MUNIT_OK;
+}
+
 /* Close the gateway early while an exec barrier is in flight. */
 TEST_CASE(exec, barrier_closing, NULL)
 {
@@ -1136,7 +1276,6 @@ TEST_CASE(exec, barrier_closing, NULL)
 	uint64_t stmt_id, prev_stmt_id;
 	(void)params;
 
-	CLUSTER_ELECT(0);
 	EXEC("CREATE TABLE test (n INT)");
 
 	/* Save this stmt to exec later */
@@ -1180,7 +1319,6 @@ TEST_CASE(exec, manyParams, NULL)
 		values[i].integer = i;
 	}
 
-	CLUSTER_ELECT(0);
 	EXEC("CREATE TABLE test (n INT)");
 	PREPARE(sql);
 	f->request.db_id = 0;
@@ -1202,7 +1340,6 @@ TEST_CASE(exec, unexpectedRow, NULL)
 	struct exec_fixture *f = data;
 	uint64_t stmt_id;
 	(void)params;
-	CLUSTER_ELECT(0);
 	PREPARE("SELECT * FROM (VALUES (1), (2))");
 	f->request.db_id = 0;
 	f->request.stmt_id = stmt_id;
@@ -1214,6 +1351,41 @@ TEST_CASE(exec, unexpectedRow, NULL)
 		       "rows yielded when none expected for EXEC request");
 	return MUNIT_OK;
 }
+
+TEST_CASE(exec, malformed_parameters, NULL)
+{
+	struct exec_fixture *f = data;
+	uint64_t stmt_id;
+	(void)params;
+	EXEC("CREATE TABLE test(id CHECK (id <> 2))");
+
+	struct value param = {
+		.type = SQLITE_INTEGER,
+		.integer = 2,
+	};
+	PREPARE("INSERT INTO test VALUES (?)");
+	f->request.db_id = 0;
+	f->request.stmt_id = stmt_id;
+	ENCODE(&f->request, exec);
+	ENCODE_PARAMS(1, &param, TUPLE__PARAMS);
+	HANDLE(EXEC);
+	WAIT;
+	ASSERT_CALLBACK(SQLITE_CONSTRAINT_CHECK, FAILURE);
+	ASSERT_FAILURE(SQLITE_CONSTRAINT_CHECK,
+		       "CHECK constraint failed: id <> 2");
+
+	ENCODE(&f->request, exec);
+	char *cursor = buffer__advance(f->buf1, 8);
+	cursor[0] = 1;
+	cursor[1] = 0xff;
+	HANDLE(EXEC);
+	WAIT;
+	ASSERT_CALLBACK(SQLITE_ERROR, FAILURE);
+	ASSERT_FAILURE(SQLITE_ERROR, "bind parameters");
+
+	return MUNIT_OK;
+}
+
 
 /******************************************************************************
  *
@@ -1232,8 +1404,8 @@ TEST_SETUP(query)
 {
 	struct query_fixture *f = munit_malloc(sizeof *f);
 	SETUP;
-	OPEN;
 	CLUSTER_ELECT(0);
+	OPEN;
 	EXEC("CREATE TABLE test (n INT, data BLOB)");
 	return f;
 }
@@ -1258,6 +1430,7 @@ TEST_CASE(query, simple, NULL)
 	f->request.stmt_id = stmt_id;
 	ENCODE(&f->request, query);
 	HANDLE(QUERY);
+	WAIT;
 	ASSERT_CALLBACK(0, ROWS);
 	uint64__decode(f->cursor, &n);
 	munit_assert_int(n, ==, 1);
@@ -1285,6 +1458,7 @@ TEST_CASE(query, one_row, NULL)
 	f->request.stmt_id = stmt_id;
 	ENCODE(&f->request, query);
 	HANDLE(QUERY);
+	WAIT;
 	ASSERT_CALLBACK(0, ROWS);
 
 	uint64__decode(f->cursor, &n);
@@ -1339,6 +1513,7 @@ TEST_CASE(query, large, NULL)
 	ENCODE(&f->request, query);
 	ENCODE_PARAMS(1, &n_rows, TUPLE__PARAMS);
 	HANDLE(QUERY);
+	WAIT;
 	ASSERT_CALLBACK(0, ROWS);
 
 	uint64__decode(f->cursor, &n);
@@ -1358,7 +1533,7 @@ TEST_CASE(query, large, NULL)
 
 	gateway__resume(f->gateway, &finished);
 	munit_assert_false(finished);
-
+	WAIT;
 	ASSERT_CALLBACK(0, ROWS);
 
 	uint64__decode(f->cursor, &n);
@@ -1607,6 +1782,7 @@ TEST_CASE(query, params, NULL)
 	ENCODE_PARAMS(2, values, TUPLE__PARAMS);
 
 	HANDLE(QUERY);
+	WAIT;
 	ASSERT_CALLBACK(0, ROWS);
 	return MUNIT_OK;
 }
@@ -1640,6 +1816,7 @@ TEST_CASE(query, interrupt, NULL)
 	ENCODE(&f->request, query);
 	ENCODE_PARAMS(1, &n_rows, TUPLE__PARAMS);
 	HANDLE(QUERY);
+	WAIT;
 	ASSERT_CALLBACK(0, ROWS);
 
 	uint64__decode(f->cursor, &n);
@@ -1710,6 +1887,7 @@ TEST_CASE(query, largeClose, NULL)
 	ENCODE(&f->request, query);
 	ENCODE_PARAMS(1, &n_rows, TUPLE__PARAMS);
 	HANDLE(QUERY);
+	WAIT;
 	ASSERT_CALLBACK(0, ROWS);
 
 	uint64__decode(f->cursor, &n);
@@ -1751,6 +1929,34 @@ TEST_CASE(query, barrier, NULL)
 	HANDLE(QUERY);
 	WAIT;
 	ASSERT_CALLBACK(0, ROWS);
+	return MUNIT_OK;
+}
+
+/* Submit a prepare request that triggers a failed barrier operation. */
+TEST_CASE(query, barrier_error, NULL)
+{
+	struct query_fixture *f = data;
+	uint64_t stmt_id;
+	(void)params;
+
+	CLUSTER_APPLIED(3);
+
+	PREPARE("SELECT n FROM test");
+
+	/* Send a barrier which will fail. */
+	struct raft_barrier faulty_barrier = {};
+	raft_fixture_append_fault(&f->cluster, 0, 0);
+	int rv = raft_barrier(CLUSTER_RAFT(0), &faulty_barrier, barrierCb);
+	munit_assert_int(rv, ==, 0);
+
+	f->request.db_id = 0;
+	f->request.stmt_id = stmt_id;
+	ENCODE(&f->request, query);
+	HANDLE_STATUS(DQLITE_REQUEST_QUERY, RAFT_OK);
+	WAIT;
+	ASSERT_CALLBACK(SQLITE_IOERR, FAILURE);
+	ASSERT_FAILURE(SQLITE_IOERR, "leader exec failed");
+
 	return MUNIT_OK;
 }
 
@@ -1887,6 +2093,7 @@ TEST_CASE(query, close_while_in_flight, NULL)
 	f->request.stmt_id = stmt_id;
 	ENCODE(&f->request, query);
 	HANDLE(QUERY);
+	WAIT;
 	ASSERT_CALLBACK(0, ROWS);
 
 	uint64__decode(f->cursor, &n);
@@ -1925,6 +2132,7 @@ TEST_SETUP(finalize)
 {
 	struct finalize_fixture *f = munit_malloc(sizeof *f);
 	SETUP;
+	CLUSTER_ELECT(0);
 	OPEN;
 	return f;
 }
@@ -1941,7 +2149,6 @@ TEST_CASE(finalize, success, NULL)
 	uint64_t stmt_id;
 	struct finalize_fixture *f = data;
 	(void)params;
-	CLUSTER_ELECT(0);
 	PREPARE("CREATE TABLE test (n INT)");
 	f->request.db_id = 0;
 	f->request.stmt_id = stmt_id;
@@ -1988,7 +2195,7 @@ TEST_CASE(exec_sql, single, NULL)
 	f->request.sql = "CREATE TABLE test (n INT)";
 	ENCODE(&f->request, exec_sql);
 	HANDLE(EXEC_SQL);
-	CLUSTER_APPLIED(4);
+	CLUSTER_APPLIED(3);
 	ASSERT_CALLBACK(0, RESULT);
 	return MUNIT_OK;
 }
@@ -2040,6 +2247,7 @@ TEST_CASE(exec_sql, invalid, NULL)
 TEST_CASE(exec_sql, multi, NULL)
 {
 	struct exec_sql_fixture *f = data;
+	raft_fixture_set_work_duration(&f->cluster, 0, 50);
 	(void)params;
 	f->request.db_id = 0;
 	f->request.sql =
@@ -2061,8 +2269,8 @@ TEST_CASE(exec_sql, attach, NULL)
 	ENCODE(&f->request, exec_sql);
 	HANDLE(EXEC_SQL);
 	WAIT;
-	ASSERT_CALLBACK(SQLITE_ERROR, FAILURE);
-	ASSERT_FAILURE(SQLITE_ERROR, "too many attached databases - max 0");
+	ASSERT_CALLBACK(SQLITE_AUTH, FAILURE);
+	ASSERT_FAILURE(SQLITE_AUTH, "not authorized");
 	return MUNIT_OK;
 }
 
@@ -2082,27 +2290,24 @@ TEST_CASE(exec_sql, closing, NULL)
 TEST_CASE(exec_sql, barrier_error, NULL)
 {
 	struct exec_sql_fixture *f = data;
-	uint64_t stmt_id;
 	(void)params;
 
-	/* Set up an uncommitted exec operation */
-	PREPARE("CREATE TABLE test (n INT)");
-	EXEC_SUBMIT(stmt_id);
-	CLUSTER_DEPOSE;
-	ASSERT_CALLBACK(SQLITE_IOERR_LEADERSHIP_LOST, FAILURE);
+	CLUSTER_APPLIED(2);
 
-	/* Submit an EXEC_SQL request, forcing a barrier, which fails */
-	CLUSTER_ELECT(0);
+	/* Send a barrier which will fail. */
+	struct raft_barrier faulty_barrier = {};
+	raft_fixture_append_fault(&f->cluster, 0, 0);
+	int rv = raft_barrier(CLUSTER_RAFT(0), &faulty_barrier, barrierCb);
+	munit_assert_int(rv, ==, 0);
+
 	f->request.db_id = 0;
-	f->request.sql = "INSERT INTO test VALUES(123)";
+	f->request.sql = "CREATE TABLE test (n INT)";
 	ENCODE(&f->request, exec_sql);
-	/* We rely on leader_barrier_v2 (called by handle_exec_sql) attempting
-	 * an allocation using raft_malloc. */
-	test_raft_heap_fault_config(1, 1);
-	test_raft_heap_fault_enable();
-	HANDLE_STATUS(DQLITE_REQUEST_EXEC_SQL, RAFT_SNAPSHOT_OK);
+	HANDLE_STATUS(DQLITE_REQUEST_EXEC_SQL, RAFT_OK);
 	WAIT;
 	ASSERT_CALLBACK(SQLITE_IOERR, FAILURE);
+	ASSERT_FAILURE(SQLITE_IOERR, "leader exec failed");
+
 	return MUNIT_OK;
 }
 
@@ -2166,6 +2371,61 @@ TEST_CASE(exec_sql, manyParams, NULL)
 	return MUNIT_OK;
 }
 
+/* Check if autovacuum can be enabled */
+TEST_CASE(exec_sql, autovacuum_full, NULL)
+{
+	struct exec_sql_fixture *f = data;
+	(void)params;
+
+	EXEC_SQL("PRAGMA auto_vacuum = FULL; VACUUM");
+	EXEC_SQL(
+		"CREATE TABLE IF NOT EXISTS test(                                   "
+		" id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT                     "
+		" -- When the definition of a table is big                          "
+		" -- enough to create an 'overflow page' and                        "
+		" -- auto_vacuum is enabled, the autovacuum                         "
+		" -- logic can try to access a page number which                    "
+		" -- is above the size of the database. In this                     "
+		" -- case, the VFS is required to return SQLITE_IOERR_SHORT_READ    "
+		" -- and zero out the buffer passed by sqlite.                      "
+		" -- From https://sqlite.org/c3ref/io_methods.html:                 "
+		" --   If xRead() returns SQLITE_IOERR_SHORT_READ it must also fill "
+		" --   in the unread portions of the buffer with zeros. A VFS that  "
+		" --   fails to zero-fill short reads might seem to work. However,  "
+		" --   failure to zero-fill short reads will eventually lead to     "
+		" --   database corruption.                                         "
+		"\n)"
+	);
+
+	return MUNIT_OK;
+}
+
+TEST_CASE(exec_sql, foreignKeys, NULL)
+{
+	struct exec_sql_fixture *f = data;
+	(void)params;
+
+	EXEC_SQL("CREATE TABLE a(id INTEGER PRIMARY KEY NOT NULL)");
+	EXEC_SQL(
+	    "CREATE TABLE b(                                      "
+		"    id INTEGER PRIMARY KEY NOT NULL,                 "
+	    "    a_id NOT NULL REFERENCES a(id) ON DELETE CASCADE "
+		")                                                    ");
+
+	EXEC_SQL("INSERT INTO a(id) VALUES (1), (2)");
+
+	/* Make sure I cannot insert garbage in b */
+	EXEC_SQL_SUBMIT("INSERT INTO b(id, a_id) VALUES (1, 10)");
+	WAIT;
+	ASSERT_CALLBACK(SQLITE_CONSTRAINT_FOREIGNKEY, FAILURE);
+	ASSERT_FAILURE(SQLITE_CONSTRAINT_FOREIGNKEY, "FOREIGN KEY constraint failed");
+
+	/* Make sure I can insert proper data in the table */
+	EXEC_SQL("INSERT INTO b(a_id) VALUES (1), (1), (2)");
+
+	return MUNIT_OK;
+}
+
 /******************************************************************************
  *
  * query_sql
@@ -2205,6 +2465,7 @@ TEST_CASE(query_sql, small, NULL)
 	f->request.sql = "SELECT n FROM test";
 	ENCODE(&f->request, query_sql);
 	HANDLE(QUERY_SQL);
+	WAIT;
 	ASSERT_CALLBACK(0, ROWS);
 	return MUNIT_OK;
 }
@@ -2280,6 +2541,7 @@ TEST_CASE(query_sql, large, NULL)
 	ENCODE(&f->request, query_sql);
 	ENCODE_PARAMS(1, &n_rows, TUPLE__PARAMS);
 	HANDLE(QUERY_SQL);
+	WAIT;
 	ASSERT_CALLBACK(0, ROWS);
 
 	uint64__decode(f->cursor, &n);
@@ -2299,7 +2561,7 @@ TEST_CASE(query_sql, large, NULL)
 
 	gateway__resume(f->gateway, &finished);
 	munit_assert_false(finished);
-
+	WAIT;
 	ASSERT_CALLBACK(0, ROWS);
 
 	uint64__decode(f->cursor, &n);
@@ -2347,6 +2609,7 @@ TEST_CASE(query_sql, largeClose, NULL)
 	ENCODE(&f->request, query_sql);
 	ENCODE_PARAMS(1, &n_rows, TUPLE__PARAMS);
 	HANDLE(QUERY_SQL);
+	WAIT;
 	ASSERT_CALLBACK(0, ROWS);
 
 	uint64__decode(f->cursor, &n);
@@ -2585,6 +2848,7 @@ TEST_CASE(query_sql, interrupt, NULL)
 	f->request.sql = "SELECT n FROM test";
 	ENCODE(&f->request, query_sql);
 	HANDLE(QUERY_SQL);
+	WAIT;
 	ASSERT_CALLBACK(0, ROWS);
 
 	uint64__decode(f->cursor, &n);
@@ -2637,6 +2901,7 @@ TEST_CASE(query_sql, params, NULL)
 	ENCODE_PARAMS(2, values, TUPLE__PARAMS);
 
 	HANDLE(QUERY_SQL);
+	WAIT;
 	ASSERT_CALLBACK(0, ROWS);
 	return MUNIT_OK;
 }
@@ -2665,16 +2930,20 @@ TEST_CASE(query_sql, manyClosing, NULL)
 	/* Insert more than maximum amount of rows that can fit in a single
 	 * response. 16 = 8B header + 8B value (int) */
 	unsigned n_rows_buffer = max_rows_buffer(16);
+	EXEC("BEGIN");
 	for (unsigned i = 0; i < n_rows_buffer + 32; i++) {
 		EXEC("INSERT INTO test VALUES(123)");
 	}
+	EXEC("COMMIT");
 	f->request.db_id = 0;
 	f->request.sql = "SELECT n FROM test";
 	ENCODE(&f->request, query_sql);
 	HANDLE(QUERY_SQL);
+	WAIT;
 	gateway__close(f->gateway, closeCb);
 	rv = gateway__resume(f->gateway, &finished);
 	munit_assert_int(rv, ==, 0);
+	WAIT;
 	return MUNIT_OK;
 }
 
@@ -2682,27 +2951,24 @@ TEST_CASE(query_sql, manyClosing, NULL)
 TEST_CASE(query_sql, barrier_error, NULL)
 {
 	struct query_sql_fixture *f = data;
-	uint64_t stmt_id;
 	(void)params;
 
-	/* Set up an uncommitted exec operation */
-	PREPARE("INSERT INTO test VALUES(123)");
-	EXEC_SUBMIT(stmt_id);
-	CLUSTER_DEPOSE;
-	ASSERT_CALLBACK(SQLITE_IOERR_LEADERSHIP_LOST, FAILURE);
+	CLUSTER_APPLIED(3);
 
-	/* Submit a QUERY_SQL request, forcing a barrier, which fails */
-	CLUSTER_ELECT(0);
+	/* Send a barrier which will fail. */
+	struct raft_barrier faulty_barrier = {};
+	raft_fixture_append_fault(&f->cluster, 0, 0);
+	int rv = raft_barrier(CLUSTER_RAFT(0), &faulty_barrier, barrierCb);
+	munit_assert_int(rv, ==, 0);
+
 	f->request.db_id = 0;
 	f->request.sql = "SELECT n FROM test";
 	ENCODE(&f->request, query_sql);
-	/* We rely on leader_barrier_v2 (called by handle_query_sql) attempting
-	 * an allocation using raft_malloc. */
-	test_raft_heap_fault_config(1, 1);
-	test_raft_heap_fault_enable();
-	HANDLE_STATUS(DQLITE_REQUEST_QUERY_SQL, RAFT_SNAPSHOT_OK);
+	HANDLE_STATUS(DQLITE_REQUEST_QUERY_SQL, RAFT_OK);
 	WAIT;
 	ASSERT_CALLBACK(SQLITE_IOERR, FAILURE);
+	ASSERT_FAILURE(SQLITE_IOERR, "leader exec failed");
+
 	return MUNIT_OK;
 }
 
@@ -2793,6 +3059,223 @@ TEST_CASE(request_cluster, unrecognizedFormat, NULL)
 	HANDLE(CLUSTER);
 	ASSERT_CALLBACK(DQLITE_PARSE, FAILURE);
 	ASSERT_FAILURE(DQLITE_PARSE, "unrecognized cluster format");
+	return MUNIT_OK;
+}
+
+/******************************************************************************
+ *
+ * dump
+ *
+ ******************************************************************************/
+
+struct file {
+	text_t name;
+	blob_t content;
+};
+
+#define DECODE_FILE(file)                                         \
+	do {                                                      \
+		int _rv = text__decode(f->cursor, &(file)->name); \
+		munit_assert_int(_rv, ==, DQLITE_OK);             \
+		_rv = blob__decode(f->cursor, &(file)->content);  \
+	} while (0)
+
+struct request_dump_fixture {
+	FIXTURE;
+	struct request_dump request;
+	struct response_files response;
+};
+
+TEST_SUITE(dump);
+TEST_SETUP(dump)
+{
+	struct request_dump_fixture *f = munit_malloc(sizeof *f);
+	SETUP;
+	CLUSTER_ELECT(0);
+	return f;
+}
+TEST_TEAR_DOWN(dump)
+{
+	struct request_dump_fixture *f = data;
+	TEAR_DOWN;
+	free(f);
+}
+
+TEST_CASE(dump, empty, NULL)
+{
+	(void)params;
+	struct request_dump_fixture *f = data;
+	f->request = (struct request_dump){
+		.filename = "test",
+	};
+	ENCODE(&f->request, dump);
+	HANDLE(DUMP);
+	ASSERT_CALLBACK(DQLITE_OK, FILES);
+	DECODE(&f->response, files);
+
+	munit_assert_int(f->response.n, ==, 2);
+	struct file main = {};
+	DECODE_FILE(&main);
+	munit_assert_string_equal(main.name, "test");
+	munit_assert_int(main.content.len, ==, 0);
+
+	struct file wal = {};
+	DECODE_FILE(&wal);
+	munit_assert_string_equal(wal.name, "test-wal");
+	munit_assert_int(wal.content.len, ==, 0);
+
+	munit_assert_int(f->cursor->cap, ==, 0);
+	return MUNIT_OK;
+}
+
+TEST_CASE(dump, not_existent, NULL)
+{
+	(void)params;
+	struct request_dump_fixture *f = data;
+	f->request = (struct request_dump){
+		.filename = "foo",
+	};
+	ENCODE(&f->request, dump);
+	HANDLE(DUMP);
+	ASSERT_CALLBACK(DQLITE_OK, FILES);
+	DECODE(&f->response, files);
+
+	munit_assert_int(f->response.n, ==, 2);
+	struct file main = {};
+	DECODE_FILE(&main);
+	munit_assert_string_equal(main.name, "foo");
+	munit_assert_int(main.content.len, ==, 0);
+
+	struct file wal = {};
+	DECODE_FILE(&wal);
+	munit_assert_string_equal(wal.name, "foo-wal");
+	munit_assert_int(wal.content.len, ==, 0);
+
+	munit_assert_int(f->cursor->cap, ==, 0);
+
+	return MUNIT_OK;
+}
+
+TEST_CASE(dump, simple, NULL)
+{
+	(void)params;
+	struct request_dump_fixture *f = data;
+
+	OPEN;
+	EXEC("CREATE TABLE test (n INT, data BLOB)");
+	EXEC("INSERT INTO test (n, data) VALUES (1, randomblob(256))");
+
+	f->request = (struct request_dump){
+		.filename = "test",
+	};
+	ENCODE(&f->request, dump);
+	HANDLE(DUMP);
+	ASSERT_CALLBACK(DQLITE_OK, FILES);
+	DECODE(&f->response, files);
+
+	munit_assert_int(f->response.n, ==, 2);
+	struct file main = {};
+	DECODE_FILE(&main);
+	munit_assert_string_equal(main.name, "test");
+	munit_assert_int(main.content.len, >, 0);
+
+	struct file wal = {};
+	DECODE_FILE(&wal);
+	munit_assert_string_equal(wal.name, "test-wal");
+	munit_assert_int(wal.content.len, >, 0);
+
+	munit_assert_int(f->cursor->cap, ==, 0);
+	return MUNIT_OK;
+}
+
+TEST_CASE(dump, simple_follower, NULL)
+{
+	(void)params;
+	struct request_dump_fixture *f = data;
+
+	OPEN;
+	EXEC("CREATE TABLE test (n INT, data BLOB)");
+	EXEC("INSERT INTO test (n, data) VALUES (1, randomblob(256))");
+	CLUSTER_APPLIED(CLUSTER_LAST_INDEX(0));
+	SELECT(1);
+
+	f->request = (struct request_dump){
+		.filename = "test",
+	};
+	ENCODE(&f->request, dump);
+	HANDLE(DUMP);
+	ASSERT_CALLBACK(DQLITE_OK, FILES);
+	DECODE(&f->response, files);
+
+	munit_assert_int(f->response.n, ==, 2);
+	struct file main = {};
+	DECODE_FILE(&main);
+	munit_assert_string_equal(main.name, "test");
+	munit_assert_int(main.content.len, >, 0);
+
+	struct file wal = {};
+	DECODE_FILE(&wal);
+	munit_assert_string_equal(wal.name, "test-wal");
+	munit_assert_int(wal.content.len, >, 0);
+
+	munit_assert_int(f->cursor->cap, ==, 0);
+	return MUNIT_OK;
+}
+
+TEST_CASE(dump, checkpointed, NULL)
+{
+	(void)params;
+	struct request_dump_fixture *f = data;
+	uint64_t stmt_id;
+
+	OPEN;
+	EXEC("CREATE TABLE test (data BLOB)");
+	/* Make sure we force a checkpoint */
+	struct config *config = f->gateway->config;
+	struct value blobsize = {
+		.type = SQLITE_INTEGER,
+		.integer = config->page_size * config->checkpoint_threshold,
+	};
+	PREPARE(
+	    "INSERT INTO test           "
+	    "SELECT RANDOMBLOB((        "
+	    "	SELECT ?                "
+	    "	FROM pragma_page_size() "
+	    "))                         ");
+	struct request_exec request = {
+		.db_id = 0,
+		.stmt_id = stmt_id,
+	};
+	struct response_result response;
+	ENCODE(&request, exec);
+	ENCODE_PARAMS(1, &blobsize, TUPLE__PARAMS);
+	HANDLE(EXEC);
+	WAIT;
+	ASSERT_CALLBACK(0, RESULT);
+	DECODE(&response, result);
+	munit_assert_int(response.rows_affected, ==, 1);
+
+	f->request = (struct request_dump){
+		.filename = "test",
+	};
+	ENCODE(&f->request, dump);
+	HANDLE(DUMP);
+	ASSERT_CALLBACK(DQLITE_OK, FILES);
+	DECODE(&f->response, files);
+
+	munit_assert_int(f->response.n, ==, 2);
+	struct file main = {};
+	DECODE_FILE(&main);
+	munit_assert_string_equal(main.name, "test");
+	munit_assert_int(main.content.len, >=,
+			 config->checkpoint_threshold * config->page_size);
+
+	struct file wal = {};
+	DECODE_FILE(&wal);
+	munit_assert_string_equal(wal.name, "test-wal");
+	munit_assert_int(wal.content.len, ==, 0);
+
+	munit_assert_int(f->cursor->cap, ==, 0);
 	return MUNIT_OK;
 }
 

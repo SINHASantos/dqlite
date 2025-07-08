@@ -1,8 +1,9 @@
-#include "lib/assert.h"
 #include "lib/serialize.h"
 
 #include "command.h"
 #include "fsm.h"
+#include "leader.h"
+#include "protocol.h"
 #include "raft.h"
 #include "tracing.h"
 #include "vfs.h"
@@ -14,52 +15,14 @@ struct fsm
 {
 	struct logger *logger;
 	struct registry *registry;
-	struct
-	{
-		unsigned n_pages;
-		unsigned long *page_numbers;
-		uint8_t *pages;
-	} pending; /* For upgrades from V1 */
 };
 
+/* Not used */
 static int apply_open(struct fsm *f, const struct command_open *c)
 {
 	tracef("fsm apply open");
 	(void)f;
 	(void)c;
-	return 0;
-}
-
-static int add_pending_pages(struct fsm *f,
-			     unsigned long *page_numbers,
-			     uint8_t *pages,
-			     unsigned n_pages,
-			     unsigned page_size)
-{
-	unsigned n = f->pending.n_pages + n_pages;
-	unsigned i;
-
-	f->pending.page_numbers = sqlite3_realloc64(
-	    f->pending.page_numbers, n * sizeof *f->pending.page_numbers);
-
-	if (f->pending.page_numbers == NULL) {
-		return DQLITE_NOMEM;
-	}
-
-	f->pending.pages = sqlite3_realloc64(f->pending.pages, n * page_size);
-
-	if (f->pending.pages == NULL) {
-		return DQLITE_NOMEM;
-	}
-
-	for (i = 0; i < n_pages; i++) {
-		unsigned j = f->pending.n_pages + i;
-		f->pending.page_numbers[j] = page_numbers[i];
-		memcpy(f->pending.pages + j * page_size,
-		       (uint8_t *)pages + i * page_size, page_size);
-	}
-	f->pending.n_pages = n;
-
 	return 0;
 }
 
@@ -83,12 +46,11 @@ static int databaseReadUnlock(struct db *db)
 	}
 }
 
-static void maybeCheckpoint(struct db *db)
+static void maybeCheckpoint(struct db *db, sqlite3 *conn)
 {
 	tracef("maybe checkpoint");
 	struct sqlite3_file *main_f;
 	struct sqlite3_file *wal;
-	volatile void *region;
 	sqlite3_int64 size;
 	unsigned page_size;
 	unsigned pages;
@@ -107,17 +69,10 @@ static void maybeCheckpoint(struct db *db)
 		return;
 	}
 
-	sqlite3 *conn = NULL;
-	rv = db__open(db, &conn);
-	if (rv != 0) {
-		tracef("open follower failed %d", rv);
-		goto err_after_db_lock;
-	}
-
 	page_size = db->config->page_size;
 	/* Get the database wal file associated with this connection */
-	rv = sqlite3_file_control(conn, "main",
-				  SQLITE_FCNTL_JOURNAL_POINTER, &wal);
+	rv = sqlite3_file_control(conn, NULL, SQLITE_FCNTL_JOURNAL_POINTER,
+				  &wal);
 	assert(rv == SQLITE_OK); /* Should never fail */
 
 	rv = wal->pMethods->xFileSize(wal, &size);
@@ -130,19 +85,12 @@ static void maybeCheckpoint(struct db *db)
 	if (pages < db->config->checkpoint_threshold) {
 		tracef("wal size (%u) < threshold (%u)", pages,
 		       db->config->checkpoint_threshold);
-		goto err_after_db_open;
+		goto err_after_db_lock;
 	}
 
 	/* Get the database file associated with this db->follower connection */
-	rv = sqlite3_file_control(conn, "main",
-				  SQLITE_FCNTL_FILE_POINTER, &main_f);
-	assert(rv == SQLITE_OK); /* Should never fail */
-
-	/* Get the first SHM region, which contains the WAL header. */
-	rv = main_f->pMethods->xShmMap(main_f, 0, 0, 0, &region);
-	assert(rv == SQLITE_OK); /* Should never fail */
-
-	rv = main_f->pMethods->xShmUnmap(main_f, 0);
+	rv = sqlite3_file_control(conn, NULL, SQLITE_FCNTL_FILE_POINTER,
+				  &main_f);
 	assert(rv == SQLITE_OK); /* Should never fail */
 
 	/* Try to acquire all locks. */
@@ -152,7 +100,7 @@ static void maybeCheckpoint(struct db *db)
 		rv = main_f->pMethods->xShmLock(main_f, i, 1, flags);
 		if (rv == SQLITE_BUSY) {
 			tracef("busy reader or writer - retry next time");
-			goto err_after_db_open;
+			goto err_after_db_lock;
 		}
 
 		/* Not locked. Let's release the lock we just
@@ -161,12 +109,12 @@ static void maybeCheckpoint(struct db *db)
 		main_f->pMethods->xShmLock(main_f, i, 1, flags);
 	}
 
-	rv = sqlite3_wal_checkpoint_v2(
-	    conn, "main", SQLITE_CHECKPOINT_TRUNCATE, &wal_size, &ckpt);
+	rv = sqlite3_wal_checkpoint_v2(conn, NULL, SQLITE_CHECKPOINT_TRUNCATE,
+				       &wal_size, &ckpt);
 	/* TODO assert(rv == 0) here? Which failure modes do we expect? */
 	if (rv != 0) {
 		tracef("sqlite3_wal_checkpoint_v2 failed %d", rv);
-		goto err_after_db_open;
+		goto err_after_db_lock;
 	}
 	tracef("sqlite3_wal_checkpoint_v2 success");
 
@@ -175,9 +123,6 @@ static void maybeCheckpoint(struct db *db)
 	assert(wal_size == 0);
 	assert(ckpt == 0);
 
-err_after_db_open:
-	sqlite3_close(conn);
-	conn = NULL;
 err_after_db_lock:
 	rv = databaseReadUnlock(db);
 	assert(rv == 0);
@@ -187,9 +132,6 @@ static int apply_frames(struct fsm *f, const struct command_frames *c)
 {
 	tracef("fsm apply frames");
 	struct db *db;
-	unsigned long *page_numbers = NULL;
-	void *pages;
-	int exists;
 	int rv;
 
 	rv = registry__db_get(f->registry, c->filename, &db);
@@ -198,99 +140,53 @@ static int apply_frames(struct fsm *f, const struct command_frames *c)
 		return rv;
 	}
 
-	/* Check if the database file exists, and create it by opening a
-	 * connection if it doesn't. */
-	rv = db->vfs->xAccess(db->vfs, db->path, 0, &exists);
-	assert(rv == 0);
-
-	if (!exists) {
-		sqlite3 *conn = NULL;
+	sqlite3 *conn = NULL;
+	if (db->active_leader != NULL) {
+		/* Leader transaction */
+		conn = db->active_leader->conn;
+	} else {
+		/* Follower transaction */
 		rv = db__open(db, &conn);
 		if (rv != 0) {
 			tracef("open follower failed %d", rv);
 			return rv;
 		}
+	}
+
+	/* The commit marker must be set as otherwise this must be an
+	 * upgrade from V1, which is not supported anymore. */
+	if (!c->is_commit) {
+		rv = DQLITE_PROTO;
+		goto error;
+	}
+
+	struct vfsTransaction transaction = {
+		.n_pages      = c->frames.n_pages,
+		.page_numbers = c->frames.page_numbers,
+		.pages   	  = c->frames.pages,
+	};
+	rv = VfsApply(conn, &transaction);
+	if (rv != 0) {
+		tracef("VfsApply failed %d", rv);
+		goto error;
+	}
+
+	maybeCheckpoint(db, conn);
+error:
+	if (db->active_leader == NULL) {
 		sqlite3_close(conn);
 	}
-
-	rv = command_frames__page_numbers(c, &page_numbers);
-	if (rv != 0) {
-		if (page_numbers != NULL) {
-			sqlite3_free(page_numbers);
-		}
-		tracef("page numbers failed %d", rv);
-		return rv;
-	}
-
-	command_frames__pages(c, &pages);
-
-	/* If the commit marker is set, we apply the changes directly to the
-	 * VFS. Otherwise, if the commit marker is not set, this must be an
-	 * upgrade from V1, we accumulate uncommitted frames in memory until the
-	 * final commit or a rollback. */
-	if (c->is_commit) {
-		if (f->pending.n_pages > 0) {
-			rv = add_pending_pages(f, page_numbers, pages,
-					       c->frames.n_pages,
-					       db->config->page_size);
-			if (rv != 0) {
-				tracef("malloc");
-				sqlite3_free(page_numbers);
-				return DQLITE_NOMEM;
-			}
-			rv =
-			    VfsApply(db->vfs, db->path, f->pending.n_pages,
-				     f->pending.page_numbers, f->pending.pages);
-			if (rv != 0) {
-				tracef("VfsApply failed %d", rv);
-				sqlite3_free(page_numbers);
-				return rv;
-			}
-			sqlite3_free(f->pending.page_numbers);
-			sqlite3_free(f->pending.pages);
-			f->pending.n_pages = 0;
-			f->pending.page_numbers = NULL;
-			f->pending.pages = NULL;
-		} else {
-			rv = VfsApply(db->vfs, db->path, c->frames.n_pages,
-				      page_numbers, pages);
-			if (rv != 0) {
-				tracef("VfsApply failed %d", rv);
-				sqlite3_free(page_numbers);
-				return rv;
-			}
-		}
-	} else {
-		rv =
-		    add_pending_pages(f, page_numbers, pages, c->frames.n_pages,
-				      db->config->page_size);
-		if (rv != 0) {
-			tracef("add pending pages failed %d", rv);
-			sqlite3_free(page_numbers);
-			return DQLITE_NOMEM;
-		}
-	}
-
-	sqlite3_free(page_numbers);
-	maybeCheckpoint(db);
-	return 0;
+	sqlite3_free(c->frames.page_numbers);
+	sqlite3_free(c->frames.pages);
+	return rv;
 }
 
+/* Not used */
 static int apply_undo(struct fsm *f, const struct command_undo *c)
 {
-	tracef("apply undo %" PRIu64, c->tx_id);
+	(void)f;
 	(void)c;
-
-	if (f->pending.n_pages == 0) {
-		return 0;
-	}
-
-	sqlite3_free(f->pending.page_numbers);
-	sqlite3_free(f->pending.pages);
-	f->pending.n_pages = 0;
-	f->pending.page_numbers = NULL;
-	f->pending.pages = NULL;
-
+	tracef("apply undo %" PRIu64, c->tx_id);
 	return 0;
 }
 
@@ -430,6 +326,10 @@ static int decodeDatabase(struct fsm *f, struct cursor *cursor)
 	rv = registry__db_get(f->registry, header.filename, &db);
 	if (rv != 0) {
 		return rv;
+	}
+
+	if (db->leaders > 0) {
+		return RAFT_BUSY;
 	}
 
 	/* Check if the database file exists, and create it by opening a
@@ -707,9 +607,6 @@ int fsm__init(struct raft_fsm *fsm,
 
 	f->logger = &config->logger;
 	f->registry = registry;
-	f->pending.n_pages = 0;
-	f->pending.page_numbers = NULL;
-	f->pending.pages = NULL;
 
 	fsm->version = 2;
 	fsm->data = f;
@@ -1124,9 +1021,6 @@ int fsm__init_disk(struct raft_fsm *fsm,
 
 	f->logger = &config->logger;
 	f->registry = registry;
-	f->pending.n_pages = 0;
-	f->pending.page_numbers = NULL;
-	f->pending.pages = NULL;
 
 	fsm->version = 3;
 	fsm->data = f;

@@ -649,13 +649,16 @@ TEST(fsm, snapshotRestore, setUp, tearDown, 0, restore_params)
 
 	rv = fsm->snapshot_finalize(fsm, &bufs, &n_bufs);
 	munit_assert_int(rv, ==, 0);
+	clientClose(f->client);
 
 	/* Additionally frees snapshot.base */
-	rv = fsm->restore(fsm, &snapshot);
+	do {
+		rv = fsm->restore(fsm, &snapshot);
+	} while (rv == RAFT_BUSY);
 	munit_assert_int(rv, ==, 0);
 
 	/* Table is there on fresh connection. */
-	test_server_client_reconnect(&f->servers[0], &f->servers[0].client);
+	test_server_client_connect(&f->servers[0], &f->servers[0].client);
 	HANDSHAKE;
 	OPEN;
 	PREPARE("SELECT COUNT(*) from test", &stmt_id);
@@ -732,12 +735,16 @@ TEST(fsm, snapshotRestoreMultipleDBs, setUp, tearDown, 0, snapshot_params)
 	PREPARE("INSERT INTO test2b(n) VALUES(1)", &stmt_id);
 	EXEC(stmt_id, &last_insert_id, &rows_affected);
 
+	clientClose(f->client);
 	/* Restore snapshot */
-	rv = fsm->restore(fsm, &snapshot);
+	do {
+		rv = fsm->restore(fsm, &snapshot);
+	} while (rv == RAFT_BUSY);
+
 	munit_assert_int(rv, ==, 0);
 
 	/* Reopen connection */
-	test_server_client_reconnect(&f->servers[0], &f->servers[0].client);
+	test_server_client_connect(&f->servers[0], &f->servers[0].client);
 	HANDSHAKE;
 	OPEN_NAME("test2");
 
@@ -779,13 +786,14 @@ TEST(fsm, applyFail, setUp, tearDown, 0, NULL)
 	void *result = (void *)(uintptr_t)0xDEADBEEF;
 
 	/* Create a frames command without data. */
-	c.filename = "test";
-	c.tx_id = 0;
-	c.truncate = 0;
-	c.is_commit = 0;
-	c.frames.n_pages = 0;
-	c.frames.page_size = 4096;
-	c.frames.data = NULL;
+	c = (struct command_frames) {
+		.filename = "test",
+		.tx_id = 0,
+		.truncate = 0,
+		.is_commit = 0,
+		.frames.n_pages = 0,
+		.frames.page_size = 4096,
+	};
 	rv = command__encode(COMMAND_FRAMES, &c, &buf);
 
 	/* Apply the command and expect it to fail. */
@@ -807,13 +815,14 @@ TEST(fsm, applyUnknownTypeFail, setUp, tearDown, 0, NULL)
 	void *result = (void *)(uintptr_t)0xDEADBEEF;
 
 	/* Create a frames command without data. */
-	c.filename = "test";
-	c.tx_id = 0;
-	c.truncate = 0;
-	c.is_commit = 0;
-	c.frames.n_pages = 0;
-	c.frames.page_size = 4096;
-	c.frames.data = NULL;
+	c = (struct command_frames) {
+		.filename = "test",
+		.tx_id = 0,
+		.truncate = 0,
+		.is_commit = 0,
+		.frames.n_pages = 0,
+		.frames.page_size = 4096,
+	};
 	rv = command__encode(COMMAND_FRAMES, &c, &buf);
 
 	/* Command type does not exist. */

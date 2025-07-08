@@ -16,13 +16,12 @@
 #include "utils.h"
 #include "vfs.h"
 
-#define leader_trace(L, fmt, ...) tracef("[leader %p]"fmt"\n", L, ##__VA_ARGS__)
+#define leader_trace(L, fmt, ...) tracef("[leader %p] "fmt, L, ##__VA_ARGS__)
 
 static bool exec_invariant(const struct sm *sm, int prev);
 static void exec_tick(struct exec *req);
 static int exec_apply(struct exec *req,
-		      dqlite_vfs_frame *pages,
-		      unsigned n_pages);
+		      const struct vfsTransaction *transaction);
 static void exec_prepare_barrier_cb(struct raft_barrier *barrier, int status);
 static void exec_run_barrier_cb(struct raft_barrier *barrier, int status);
 static void exec_apply_cb(struct raft_apply *req, int status, void *result);
@@ -71,7 +70,7 @@ static void leader_finalize(struct leader *leader)
 	PRE(leader->db->leaders > 0);
 	tracef("leader close");
 	sqlite3_interrupt(leader->conn);
-	int rc = sqlite3_close(leader->conn);
+	int rc = sqlite3_close_v2(leader->conn);
 	assert(rc == 0);
 	if (leader->db->active_leader == leader) {
 		leader_trace(leader, "done");
@@ -132,8 +131,8 @@ static void leaderMaybeCheckpointLegacy(struct leader *leader)
 	int rv;
 
 	/* Get the database file associated with this connection */
-	rv = sqlite3_file_control(leader->conn, "main", SQLITE_FCNTL_JOURNAL_POINTER,
-				  &wal);
+	rv = sqlite3_file_control(leader->conn, NULL,
+				  SQLITE_FCNTL_JOURNAL_POINTER, &wal);
 	assert(rv == SQLITE_OK); /* Should never fail */
 	if (wal == NULL || wal->pMethods == NULL) {
 		/* This might happen at the beginning of the leader life cycle, 
@@ -303,6 +302,8 @@ void leader_exec(struct leader *leader,
 
 void leader_exec_abort(struct exec *req)
 {
+	leader_trace(req->leader, "abort in state %s", exec_state_name(sm_state(&req->sm)));
+
 	switch (sm_state(&req->sm)) {
 	case EXEC_DONE: /* already done */
 		return;
@@ -343,18 +344,19 @@ void leader_exec_resume(struct exec *req)
 	TAIL return exec_tick(req);
 }
 
-static int exec_apply(struct exec *req, dqlite_vfs_frame *frames, unsigned nframes)
+static int exec_apply(struct exec *req, const struct vfsTransaction *transaction)
 {
 	tracef("leader apply frames");
 	PRE(req != NULL);
-	PRE(frames != NULL);
-	PRE(nframes > 0);
+	PRE(transaction->n_pages > 0);
+	PRE(transaction->page_numbers != NULL);
+	PRE(transaction->pages != NULL);
 
 	struct leader *leader = req->leader;
 	struct db *db = leader->db;
 	struct raft_buffer buf;
 
-	if (is_db_full(req->leader->db->vfs, req->leader->db, nframes)) {
+	if (is_db_full(req->leader->db->vfs, req->leader->db, transaction->n_pages)) {
 		return SQLITE_FULL;
 	}
 
@@ -364,9 +366,10 @@ static int exec_apply(struct exec *req, dqlite_vfs_frame *frames, unsigned nfram
 		.truncate = 0,
 		.is_commit = 1,
 		.frames = {
-			.n_pages = (uint32_t)nframes,
+			.n_pages = (uint32_t)transaction->n_pages,
 			.page_size = (uint16_t)db->config->page_size,
-			.data = frames,
+			.page_numbers = transaction->page_numbers,
+			.pages = transaction->pages,
 		}
 	};
 	int rv = command__encode(COMMAND_FRAMES, &c, &buf);
@@ -447,8 +450,7 @@ static void exec_tick(struct exec *req)
 	PRE(req->leader != NULL && req->leader->db != NULL);
 	struct leader *leader = req->leader;
 	struct db *db = leader->db;
-	dqlite_vfs_frame *frames;
-	unsigned int nframes;
+	struct vfsTransaction transaction;
 
 	for (;;) {
 		leader_trace(leader, "exec tick %s (status = %d)",
@@ -577,34 +579,28 @@ static void exec_tick(struct exec *req)
 				continue;
 			}
 
-			/* 
-			 * FIXME: If this was a xFileControl:
-			 *  - it would be callable through sqlite3_file_control
-			 *  - it would set the error for the connection (so, no translation needed here)
-			 *  - it would not be necessary to keep a vfs pointer in the db
-			 *  - it would not necessary to lookup the database by path every time.
-			 */
-			int rc = VfsPoll(db->vfs, db->path, &frames, &nframes);
+			int rc = VfsPoll(leader->conn, &transaction);
 			if (rc != SQLITE_OK) {
 				leader_trace(leader, "poll failed on leader");
-				rc = VfsAbort(leader->db->vfs, leader->db->path);
+				rc = VfsAbort(leader->conn);
 				assert(rc == SQLITE_OK);
 				req->status = RAFT_IOERR;
 				sm_move(&req->sm, EXEC_DONE);
 				continue;
 			}
 
-			leader_trace(leader, "polled connection (%d frames)", nframes);
-			if (nframes == 0) {
+			leader_trace(leader, "polled connection (%d frames)", transaction.n_pages);
+			if (transaction.n_pages == 0) {
 				sm_move(&req->sm, EXEC_DONE);
 				continue;
 			}
 
-			req->status = exec_apply(req, frames, nframes);
-			for (unsigned i = 0; i < nframes; i++) {
-				sqlite3_free(frames[i].data);
+			req->status = exec_apply(req, &transaction);
+			for (unsigned i = 0; i < transaction.n_pages; i++) {
+				sqlite3_free(transaction.pages[i]);
 			}
-			sqlite3_free(frames);
+			sqlite3_free(transaction.pages);
+			sqlite3_free(transaction.page_numbers);
 
 			if (req->status != 0) {
 				sm_move(&req->sm, EXEC_DONE);
@@ -691,7 +687,7 @@ static void exec_apply_cb(struct raft_apply *apply, int status, void *result)
 	leader_trace(leader, "query applied (status=%d)", status);
 	if (leader) {
 		if (status != 0) {
-			VfsAbort(leader->db->vfs, leader->db->path);
+			VfsAbort(leader->conn);
 		} else {
 			leaderMaybeCheckpointLegacy(leader);
 		}

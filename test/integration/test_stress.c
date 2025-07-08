@@ -38,13 +38,19 @@ struct worker {
 static void *client_read(void *data)
 {
 	const char *sql =
-	    "SELECT MAX(n)         "
-	    "FROM (                "
-	    "    SELECT n          "
-	    "    FROM test         "
-	    "    ORDER BY random() "
-	    "    LIMIT 100         "
-	    ")                     ";
+		"WITH RECURSIVE seq(n, id) AS ("
+		"    SELECT 1, random()        "
+		"    UNION ALL                 "
+		"    SELECT n+1, random()      "
+		"    FROM seq                  "
+		"    WHERE n < 100             "
+		")                             "
+		"SELECT MAX(test.n)            "
+		"FROM test JOIN seq            "
+		"    ON test.rowid = seq.id % ("
+		"        SELECT MAX(rowid)     "
+		"        FROM test             "
+		"    )                         ";
 
 	struct worker *self = data;
 	struct client_proto client;
@@ -60,7 +66,7 @@ static void *client_read(void *data)
 		QUERY_DONE_C(&client, stmt_id, &rows, {});
 	}
 
-	test_server_client_close(&self->f->server, &client);
+	clientClose(&client);
 	return NULL;
 }
 
@@ -85,18 +91,21 @@ static void *client_write(void *data)
 
 		rv = clientRecvResult(&client, &last_insert_id, &rows_affected,
 				      NULL);
-		if (rv == DQLITE_CLIENT_PROTO_RECEIVED_FAILURE &&
-		    client.errcode == SQLITE_BUSY) {
-			/* Just retry */
-			i--;
-		} else {
-			munit_assert_int(rv, ==, DQLITE_OK);
-			munit_assert_int(last_insert_id, >, 1);
-			munit_assert_int(rows_affected, ==, 1);
+		if (rv == DQLITE_CLIENT_PROTO_RECEIVED_FAILURE) {
+		    if (client.errcode == SQLITE_BUSY) {
+				/* Just retry */
+				i--;
+				continue;
+			}
+			munit_errorf("failure: [%ld] %s", client.errcode,
+				     client.errmsg);
 		}
+		munit_assert_int(rv, ==, DQLITE_OK);
+		munit_assert_int(last_insert_id, >, 1);
+		munit_assert_int(rows_affected, ==, 1);
 	}
 
-	test_server_client_close(&self->f->server, &client);
+	clientClose(&client);
 	return NULL;
 }
 
